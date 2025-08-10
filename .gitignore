@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Outputs
+outputs/models/
+outputs/logs/
+outputs/predictions/
+outputs/export/
+
+# Data
+data/interim/
+data/processed/*.json
+data/processed/stats.json

@@ -1,0 +1,19 @@
+# src/config/default.yaml
+# 하이퍼파라미터/경로 설정
+seed: 42
+paths:
+  raw: data/raw/최종_학습데이터셋_clean.txt
+  processed_dir: data/processed
+  output_dir: outputs/models/koelectra_crf
+model:
+  backbone: monologg/koelectra-small-discriminator
+  max_len: 256
+train:
+  batch_size: 16
+  lr: 3e-5
+  epochs: 6
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  grad_clip: 1.0
+eval:
+  eval_steps: 200

@@ -1,0 +1,18 @@
+{
+  "thresholds": {
+    "TITLE": 0.55,
+    "DATE": 0.5,
+    "TIME": 0.5,
+    "PRICE": 0.5,
+    "PRICE_TYPE": 0.5,
+    "PRICE_ONSITE": 0.5,
+    "LINEUP": 0.55,
+    "INSTAGRAM": 0.55,
+    "VENUE": 0.5,
+    "V_INSTA": 0.5,
+    "TICKET_OPEN_DATE": 0.5,
+    "TICKET_OPEN_TIME": 0.5
+  },
+  "dev_token_f1": 0.35935077548398253,
+  "dev_schema": 1.0
+}
