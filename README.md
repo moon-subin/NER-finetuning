@@ -3,6 +3,17 @@
 ## Quick Start
 ```bash
 # 0) create venv & install
+# 루트 이동
+cd ...\NER-finetuning
+
+# venv 활성화(이미 했다면 생략)
+python -m venv venv
+venv\Scripts\activate
+
+# pip 업그레이드
+python -m pip install --upgrade pip
+
+# 설치
 pip install -r requirements.txt
 
 # 1) split BIO -> CoNLL
@@ -32,7 +43,7 @@ python scripts/calibrate_thresholds.py `
   --out_path outputs/thresholds.json
 
 # 규칙+thresholds 적용
-python scripts\apply_rules.py `
+python scripts/apply_rules.py `
   --in_jsonl outputs/predictions/test_pred_with_conf.jsonl `
   --thresholds outputs/thresholds.json `
   --artists_csv data/lexicon/artists.csv `

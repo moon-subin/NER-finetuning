@@ -2,7 +2,12 @@
 # raw → processed/*.conll 생성
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import argparse, os, json
+import argparse, sys, os, json
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from src.data.load_bio import read_bio_txt
 from src.data.split import split_dataset
 

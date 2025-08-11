@@ -1,8 +1,14 @@
 # scripts/apply_rules.py
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os, io, json, argparse
+import sys, os, io, json, argparse
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+    
 from src.rules.regex_postrules import merge_model_and_rules, schema_guard, load_lexicons
+sys.path.append(os.path.abspath(".")) 
 
 def load_thresholds(path):
     with io.open(path, "r", encoding="utf-8") as f:

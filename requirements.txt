@@ -1,6 +1,6 @@
 torch>=2.1.0
 transformers>=4.41.0
-pytorch-crf==1.1.0
+pytorch-crf>=0.7.2
 seqeval>=1.2.2
 pandas>=2.2.0
 numpy>=1.26.0

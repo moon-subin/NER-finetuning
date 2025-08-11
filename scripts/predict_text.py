@@ -2,17 +2,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-한 줄 텍스트 → NER 예측(+conf) → thresholds + 규칙 적용 → 최종 fields 출력
-사용 예:
+한 줄 텍스트 → NER 예측(+confidence) → thresholds + 규칙 적용 → 최종 fields 출력
+
+예)
   python scripts/predict_text.py ^
-    --model_dir outputs/checkpoints/best_model ^
+    --model_dir outputs/models/koelectra_crf ^
     --text "2025년 6월 26일 저녁 7시 유인원 단독 콘서트 Our Nature, 예매 30,000원 현매 35,000원" ^
     --thresholds outputs/thresholds.json ^
     --artists_csv data/lexicon/artists.csv ^
-    --venues_csv data/lexicon/venues.csv
+    --venues_csv data/lexicon/venues.csv ^
+    --save_jsonl outputs/predictions/custom_text.jsonl
 """
+
 import os, sys, io, re, json, argparse
-sys.path.append(os.path.abspath("."))  # allow "src.*" imports
+
+# ── 프로젝트 루트 경로를 sys.path에 주입 (항상 src.* 임포트 가능)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 import torch.nn.functional as F
@@ -27,15 +34,13 @@ def simple_tokenize(text: str):
     한국 공연 공지 특화 간이 토크나이저:
     - 가격: 30,000원 / 45,000원
     - 날짜: 2025년 / 9월 / 21일 / (일)
-    - 시간: 오후 6시 / 낮 12시 / 7:30
+    - 시간: 오전/오후/낮/밤/저녁/새벽 + '숫자시(분)' 또는 12:30
     - @handle, 영문/한글 단어, 구두점
     """
     text = re.sub(r"\s+", " ", text.strip())
 
     price = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:원)?"
-    # 요일 괄호 토큰
     weekday_paren = r"\([월화수목금토일]\)"
-    # 시간: 오전/오후/낮/밤/저녁/새벽 + '숫자시(분)'
     time_units = r"(?:(?:오전|오후|낮|밤|저녁|새벽)\s*\d{1,2}시(?:\s*\d{1,2}분)?|\d{1,2}:\d{2}|\d{1,2}시(?:\s*\d{1,2}분)?)"
     date_units = r"(?:\d{4}년|\d{1,2}월|\d{1,2}일)"
 
@@ -46,7 +51,7 @@ def simple_tokenize(text: str):
 
     toks = token_re.findall(text)
 
-    # '35,000' '원' → '35,000원'으로 결합
+    # '35,000' '원' → '35,000원' 결합
     merged = []
     i = 0
     while i < len(toks):
@@ -78,6 +83,9 @@ def load_labels_from_model_dir(model_dir: str):
     cfg = AutoConfig.from_pretrained(model_dir)
     if getattr(cfg, "id2label", None):
         id2 = cfg.id2label
+        # id2가 dict일 수 있으므로 index 순서 보장
+        if isinstance(id2, dict):
+            return [id2[str(i)] if str(i) in id2 else id2[i] for i in range(len(id2))]
         return [id2[i] for i in range(len(id2))]
     raise RuntimeError(f"labels not found under {model_dir}")
 
@@ -100,11 +108,15 @@ def tokens_to_wp(tokenizer, tokens, max_len: int):
 
 
 def decode_wp(label_ids, align, id2label):
-    lab_by_token = ["O"] * (int(align.max().item()) + 1 if (align >= 0).any() else 0)
+    # align의 최초 등장 sub-token 위치의 라벨만 취함
+    max_tok = int(align.max().item()) if (align >= 0).any() else -1
+    lab_by_token = ["O"] * (max_tok + 1 if max_tok >= 0 else 0)
+    seen = set()
     for pos, wid in enumerate(label_ids):
         tok_idx = int(align[pos].item())
-        if 0 <= tok_idx < len(lab_by_token):
+        if 0 <= tok_idx < len(lab_by_token) and tok_idx not in seen:
             lab_by_token[tok_idx] = id2label[wid]
+            seen.add(tok_idx)
     return lab_by_token
 
 
@@ -116,6 +128,7 @@ def main():
     ap.add_argument("--artists_csv", default=None)
     ap.add_argument("--venues_csv", default=None)
     ap.add_argument("--max_len", type=int, default=256)
+    ap.add_argument("--save_jsonl", default=None, help="RAW 예측(jsonl) 저장 경로(옵션)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,11 +139,20 @@ def main():
     num_labels = len(labels)
 
     config = AutoConfig.from_pretrained(args.model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    backbone_name = getattr(config, "_name_or_path", None) or args.model_dir
+    # 토크나이저가 model_dir에 없으면 backbone 이름으로 재시도
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    except Exception:
+        backbone_name = getattr(config, "_name_or_path", None) or "monologg/koelectra-base-v3-discriminator"
+        tokenizer = AutoTokenizer.from_pretrained(backbone_name)
 
+    backbone_name = getattr(config, "_name_or_path", None) or args.model_dir
     model = ElectraCRF(backbone_name, num_labels=num_labels).to(device)
-    state = torch.load(os.path.join(args.model_dir, "pytorch_model.bin"), map_location=device)
+
+    state_path = os.path.join(args.model_dir, "pytorch_model.bin")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(f"model weights not found: {state_path}")
+    state = torch.load(state_path, map_location=device)
     model.load_state_dict(state, strict=True)
     model.eval()
 
@@ -154,25 +176,40 @@ def main():
 
     # WP → token (첫 sub-token만 사용)
     pred_labels = decode_wp(wp_pred, align, id2label)
+
+    # 토큰별 confidence 정렬
     conf_token  = []
     seen=set()
     for pos in range(align.size(0)):
         idx = int(align[pos].item())
-        if idx >= 0 and idx not in seen and pos < len(wp_conf):
+        if idx >= 0 and idx not in seen and (pos < len(wp_conf)):
             conf_token.append(wp_conf[pos]); seen.add(idx)
+    # 길이 보정
     while len(conf_token) < len(pred_labels): conf_token.append(0.5)
     if len(conf_token) > len(pred_labels): conf_token = conf_token[:len(pred_labels)]
+
+    # RAW 저장(option) — apply_rules.py에서 재사용 가능
+    if args.save_jsonl:
+        os.makedirs(os.path.dirname(args.save_jsonl) or ".", exist_ok=True)
+        with io.open(args.save_jsonl, "w", encoding="utf-8") as f:
+            ex = {
+                "tokens": tokens,
+                "model_labels": pred_labels,
+                "confidences": conf_token,
+                "text": args.text,
+            }
+            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
     # rules + thresholds 적용
     thresholds = {}
     if args.thresholds and os.path.exists(args.thresholds):
         with io.open(args.thresholds, "r", encoding="utf-8") as f:
             got = json.load(f)
-        thresholds = got.get("thresholds", got)  # 파일 구조 2가지 케이스 지원
+        thresholds = got.get("thresholds", got)  # {"DATE":0.5,...} or plain dict
 
     lex = load_lexicons(args.artists_csv, args.venues_csv)
     merged = merge_model_and_rules(tokens, pred_labels, conf_token, thresholds, lexicons=lex)
-    final_doc = schema_guard(merged)
+    clean  = schema_guard(merged)
 
     # 출력
     print("\n=== INPUT TEXT ===")
@@ -180,15 +217,10 @@ def main():
     print("\n=== TOKENS ===")
     print(tokens)
     print("\n=== MODEL PRED (token-level) ===")
-    # 짧게 앞부분만 보여주고 싶으면 슬라이스 가능
     print(list(zip(tokens, pred_labels, [round(c,3) for c in conf_token])))
 
     print("\n=== FINAL FIELDS (after thresholds + rules) ===")
-    print(json.dumps(final_doc.get("fields", {}), ensure_ascii=False, indent=2))
-
-    # 원하면 full json도 보기
-    # print("\n=== FULL DOC ===")
-    # print(json.dumps(final_doc, ensure_ascii=False, indent=2))
+    print(json.dumps(clean, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
