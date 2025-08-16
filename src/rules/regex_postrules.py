@@ -11,10 +11,11 @@ regex_postrules.py — 모델 예측 결과를 규칙으로 보정하는 후처�
 내부(규칙 본체):
 - apply_regex_postrules(text, tokens, fields, lexicons=None) -> Dict (필드 보정)
 """
-
 from __future__ import annotations
+
 import re
 import csv
+import unicodedata
 from typing import Dict, List, Tuple, Optional
 
 # =========================
@@ -28,7 +29,7 @@ RE_DOW = r'(?:\s*\((?P<dow>[월화수목금토일]|Mon|Tue|Wed|Thu|Fri|Sat|Sun)\
 RE_FULLDATE_OPT_YEAR = re.compile(rf'(?:{RE_YEAR}\s*)?{RE_MD}\s*{RE_DOW}')
 RE_FULLDATE_MUST_YEAR = re.compile(rf'{RE_YEAR}\s*{RE_MD}\s*{RE_DOW}')
 
-# 시간(패치): 맨숫자 금지. am/pm 있으면 '시' 없어도, 없으면 '시' 필수.
+# 시간(한글/숫자)
 RE_TIME = re.compile(
     r'((?P<ampm>오전|오후|낮|밤|저녁)\s*(?P<hour1>\d{1,2})(?:\s*:\s*(?P<min1>\d{2}))?\s*시?)'
     r'|'
@@ -37,44 +38,129 @@ RE_TIME = re.compile(
     r'((?P<hour3>\d{1,2})\s*시)'
 )
 
-# 숫자+원
-RE_PRICE = re.compile(r'(?P<amount>\d{1,3}(?:,\d{3})+|\d{4,6})\s*원?')
+# 영어 AM/PM 시각/범위
+RE_EN_TIME = re.compile(r'\b(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>AM|PM|am|pm)\b')
+RE_EN_TIME_RANGE = re.compile(r'\b(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?-(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\s*(?P<ap>AM|PM|am|pm)\b')
 
-# 한국식 금액(패치)
-RE_KR_PRICE = re.compile(
-    r'(?:(?P<man>\d+)\s*만)?\s*(?:(?P<chon>\d+)\s*천)?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+)?\s*원?'
+# 08.02 / 08/02 / 08-02 (+ optional year, DOW)
+RE_MD_DOTTED = re.compile(
+    r'\b(?P<m>\d{1,2})[.\-/](?P<d>\d{1,2})(?:[.\-/](?P<y>\d{2,4}))?(?:\s*\.\s*)?(?:\s*\((?P<dow>[A-Za-z]{3})\))?\b'
 )
 
-# '티켓 오픈' 또는 '티켓은 … 오픈'(패치)
+# 숫자+통화 (원/₩/￦/KRW, 통화 기호가 앞뒤 어디에 있어도 허용)
+RE_PRICE = re.compile(
+    r'(?:(?:₩|￦)\s*)?(?P<amount>\d{1,3}(?:,\d{3})+|\d{4,6}|\d+)\s*(?:원|₩|￦|KRW)?',
+    re.IGNORECASE
+)
+
+# 한국식 금액(3만5천 등) + 통화 단위 확장
+RE_KR_PRICE = re.compile(
+    r'(?:(?P<man>\d+)\s*만)?\s*(?:(?P<chon>\d+)\s*천)?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+)?\s*(?:원|₩|￦|KRW)?',
+    re.IGNORECASE
+)
+
+# '티켓 오픈' 또는 '티켓은 … 오픈'
 RE_TICKET_OPEN = re.compile(r'티\s*켓\s*(?:은|:)?[^\n]{0,20}?오\s*픈', re.IGNORECASE)
 
-# 공연장 키워드
-VENUE_KEYWORDS = r'(홀|클럽|라이브|센터|스테이지|스튜디오|씨어터|극장|하우스|라운지|스퀘어|플랫폼|플레이스|페스티벌|레코드|창고|공간|바|펍|플라자|파크|웨이브|베뉴)'
+# 공연장 키워드(+살롱)
+VENUE_KEYWORDS = r'(홀|클럽|라이브|센터|스테이지|스튜디오|씨어터|극장|하우스|라운지|스퀘어|플랫폼|플레이스|페스티벌|레코드|창고|공간|바|펍|플라자|파크|웨이브|베뉴|살롱)'
+
+# VENUE 오탐 방지 블랙리스트
+VENUE_BLACKLIST_WORDS = {'도어', '티케팅', '티켓팅', '입장', '현매', '예약', '예매'}
 
 # LINEUP 불용 토큰
 LINEUP_STOPWORDS = {'티켓','오픈','출연','공연','콘서트','쇼케이스','단독','공지','예매','현매','현장','가격'}
-
 TITLE_STOP = {'달','공지','안내','정보','발표'}
-
 POSTFIX_JOSA = re.compile(r'(와|과|이|가|는|은|도|를|을|과의|와의)$')
 
+# 라인업/섹션 탐지
+LINEUP_SEC_HEAD = re.compile(
+    r'^\s*(?:\[?\s*(?:LINE\s*[- ]?\s*UP|라인업|ARTIST|Artist(?:\s*information)?|Artist\s*Info)\s*\]?|\-+\s*LINE\s*UP\s*\-+)\s*$',
+    re.IGNORECASE | re.MULTILINE
+)
+BULLET_LINE = re.compile(r'^\s*[✅▪️•●◦\-–—▶]\s*(.+)$', re.MULTILINE)
+NAME_CAND = re.compile(
+    r'^\s*(?P<name>(?:DJ\s+)?[A-Za-z][A-Za-z0-9 .\'\-\&\?\/!·:_]{1,60}|[가-힣0-9·]+(?:\s[가-힣0-9·]+){0,6})'
+    r'(?:\s*\([^)]+\))?\s*(?:@[A-Za-z0-9._]+)?\s*$'
+)
+SECTION_BREAK = re.compile(
+    r'^\s*(?:\[.*?\]|공연\s*정보|일시|장소|티켓|입장|문의|PRICE|TIME|DATE)\s*[:|]|^[-=]{3,}\s*$',
+    re.MULTILINE
+)
+LINEUP_BLACKLIST_SUBSTR = {
+    '오픈', '티켓', '문의', '입장', '가격', '현매', '예매', '공지', '안내',
+    '라이브홀', '클럽', '홀', '극장', '페스티벌', '월드뮤직', '록 페스티벌',
+    '노들섬', '스트레인지', '프룻', '장소', '일시'
+}
+
+# 굵은 유니코드 헤더(쇼케이스/음감회/DJ)
+SECTION_SHOWCASE_HEAD = re.compile(
+    r'^\s*\[\s*(?:Showcase|쇼케이스)\s*(?:\|\s*(?:Showcase|쇼케이스))?\s*\]\s*$',
+    re.IGNORECASE | re.MULTILINE
+)
+SECTION_LISTEN_HEAD = re.compile(
+    r'^\s*\[\s*(?:Listening\s*Session|음감회)\s*(?:\|\s*(?:Listening\s*Session|음감회))?\s*\]\s*$',
+    re.IGNORECASE | re.MULTILINE
+)
+SECTION_DJ_HEAD = re.compile(
+    r'^\s*\[\s*(?:DJ|디제이)\s*(?:\|\s*(?:DJ|디제이))?\s*\]\s*$',
+    re.IGNORECASE | re.MULTILINE
+)
 
 # =========================
 # 유틸
 # =========================
 
+def _extract_title_from_head(text: str) -> Optional[str]:
+    """맨 앞쪽 짧은 헤더 라인을 타이틀로 채택"""
+    for ln in text.splitlines():
+        s = _strip_space(ln)
+        if not s:
+            continue
+        # 너무 길면 배제 (포스터 설명문 방지), 토막 단어만도 배제
+        if 3 <= len(s) <= 80 and re.search(r'(Vol\.?\s*\d+|LIVE|Vol|공연|Concert|Show|Night|Festival)', s, re.IGNORECASE):
+            return s
+        # 위 키워드 없어도 대문자/Title Case가 강하면 허용
+        if 3 <= len(s) <= 60 and re.search(r'[A-Za-z].*[A-Za-z]', s) and not re.search(r'[.:]\s*$', s):
+            return s
+    return None
+
+def _to_ascii_compat(s: str) -> str:
+    """굵은 유니코드, 전각/장식 기호를 ASCII 근사치로 정규화"""
+    if not s:
+        return s
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    s = (s.replace('◉', ' ')
+           .replace('✹', '-')
+           .replace('•', '-')
+           .replace('▪️', '-')
+           .replace('●', '-')
+           .replace('◦', '-')
+           .replace('\u3000', ' ')
+           .replace('–', '-')
+           .replace('—', '-'))
+    return s
+
 def _strip_josa(name: str) -> str:
     return POSTFIX_JOSA.sub('', _strip_space(name))
 
 def _find_dates_with_span(text: str):
-    return [( _join_full_date(m), m.start(), m.end() ) for m in RE_FULLDATE_OPT_YEAR.finditer(text)]
+    return [(_join_full_date(m), m.start(), m.end()) for m in RE_FULLDATE_OPT_YEAR.finditer(text)]
 
 def _find_times_with_span(text: str):
     out = []
     for m in RE_TIME.finditer(text):
-        out.append( (_normalize_time(m.group(0)), m.start(), m.end()) )
+        out.append((_normalize_time(m.group(0)), m.start(), m.end()))
+    # 영어 단건
+    for m in RE_EN_TIME.finditer(text):
+        h = int(m.group('h'))
+        out.append((f"{h}시", m.start(), m.end()))
+    # 영어 범위: 시작만
+    for m in RE_EN_TIME_RANGE.finditer(text):
+        h1 = int(m.group('h1'))
+        out.append((f"{h1}시", m.start(), m.end()))
     return out
-
 
 def _tidy_title(fields: Dict) -> None:
     xs = []
@@ -88,7 +174,8 @@ def _tidy_title(fields: Dict) -> None:
 
 def _price_to_int(p: str) -> int:
     try:
-        return int(p.replace(',', '').replace('원','').strip())
+        digits = re.sub(r'[^\d]', '', p)  # 콤마/통화문자 등 제거
+        return int(digits) if digits else -1
     except:
         return -1
 
@@ -124,8 +211,13 @@ def _normalize_time(s: str) -> str:
     return _strip_space(f"{ampm} {t}".strip())
 
 def _normalize_price(s: str) -> str:
-    m = RE_PRICE.search(s)
-    if not m: return _strip_space(s)
+    raw = _strip_space(s)
+    # 통화 표기 통일
+    raw = re.sub(r'\bKRW\b', '원', raw, flags=re.IGNORECASE)
+    raw = raw.replace('₩', '원').replace('￦', '원')
+    m = RE_PRICE.search(raw)
+    if not m:
+        return _strip_space(raw)
     amount = m.group('amount')
     if ',' not in amount and len(amount) > 3:
         amount = f"{int(amount):,}"
@@ -133,6 +225,9 @@ def _normalize_price(s: str) -> str:
 
 def _parse_kr_price(s: str) -> Optional[str]:
     raw = _strip_space(s)
+    # 통화 표기 통일
+    raw = re.sub(r'\bKRW\b', '원', raw, flags=re.IGNORECASE)
+    raw = raw.replace('₩', '원').replace('￦', '원')
     m = RE_KR_PRICE.fullmatch(raw)
     if not m:
         return None
@@ -140,7 +235,6 @@ def _parse_kr_price(s: str) -> Optional[str]:
     chon = m.group('chon')
     num = m.group('num')
 
-    # '3' 단독 같은 경우 배제(단위/원 없고 4자리 미만)
     has_unit = ('만' in raw) or ('천' in raw) or ('원' in raw)
     long_num = bool(num and len(num.replace(',', '')) >= 4)
     if not (man or chon or has_unit or long_num):
@@ -159,15 +253,69 @@ def _window_after(text: str, start_idx: int, max_chars: int = 80) -> str:
 
 def _find_all_full_dates(text: str) -> List[str]:
     out = []
+    # 한글형
     for m in RE_FULLDATE_OPT_YEAR.finditer(text):
         out.append(_join_full_date(m))
+    # 08.02 / 08/02 / 08-02
+    for m in RE_MD_DOTTED.finditer(text):
+        y = m.group('y'); mth = m.group('m'); day = m.group('d'); dow = m.group('dow')
+        core = f"{int(mth)}월 {int(day)}일"
+        if dow:
+            core += f" ({dow})"
+        if y and len(y) == 4:
+            out.append(f"{y}년 {core}")
+        else:
+            out.append(core)
     return _dedupe(out)
 
 def _find_all_times(text: str) -> List[str]:
     out = []
+    # 한글/숫자
     for m in RE_TIME.finditer(text):
         out.append(_normalize_time(m.group(0)))
+    # 영어 단건 → 'X시'
+    for m in RE_EN_TIME.finditer(text):
+        h = int(m.group('h'))
+        out.append(f"{h}시")
+    # 영어 범위 → 시작 시각만 'X시'
+    for m in RE_EN_TIME_RANGE.finditer(text):
+        h1 = int(m.group('h1'))
+        out.append(f"{h1}시")
     return _dedupe(out)
+
+def _merge_date_with_weekday(dates: list[str]) -> list[str]:
+    """DATE 리스트에서 '날짜' + '(요일)' 형태를 하나로 합침."""
+    merged = []
+    skip_next = False
+    for i, val in enumerate(dates):
+        if skip_next:
+            skip_next = False
+            continue
+        # 날짜 + 다음 항목이 (요일)인 경우
+        if i + 1 < len(dates) and re.match(r'^\(?[월화수목금토일]\)?$', dates[i+1]) or re.match(r'^\([월화수목금토일]\)$', dates[i+1]):
+            weekday = dates[i+1].strip()
+            weekday = weekday if weekday.startswith("(") else f"({weekday})"
+            merged.append(f"{val} {weekday}")
+            skip_next = True
+        else:
+            merged.append(val)
+    return merged
+
+def _pick_start_time_only(text: str, times: List[str]) -> List[str]:
+    """
+    'OPEN 18:00' / 'START 18:30' 같이 있으면 START에 붙은 시각만 남김
+    """
+    # START 라인에서 숫자시각(또는 hh:mm) 우선 추출
+    m = re.search(r'\bSTART\b[^\n]{0,20}?(\d{1,2}(?::\d{2})?)', text, flags=re.IGNORECASE)
+    if m:
+        val = m.group(1)
+        # '18:30' → '18:30', '18' → '18시'
+        if ':' in val:
+            keep = val
+        else:
+            keep = f"{int(val)}시"
+        return [keep]
+    return times
 
 def _merge_year_with_partial_dates(tokens: List[str], existing_dates: List[str]) -> List[str]:
     merged = list(existing_dates)
@@ -188,10 +336,6 @@ def _clean_venue_token(v: str) -> str:
     return _strip_space(v)
 
 def _combine_area_and_venue(text: str, venues: List[str]) -> List[str]:
-    """
-    '홍대 롤링홀에서' 뿐 아니라
-    '클럽 FF에서'처럼 '접두 키워드(클럽/홀/극장...) + 고유명'도 결합 (패치)
-    """
     candidates = list(venues)
     for m in re.finditer(r'([가-힣A-Za-z·]+)\s+([가-힣A-Za-z·0-9]+?)\s*(?:에서|에)\b', text):
         area, place = m.group(1), m.group(2)
@@ -200,22 +344,170 @@ def _combine_area_and_venue(text: str, venues: List[str]) -> List[str]:
     return _dedupe([_clean_venue_token(v) for v in candidates])
 
 # =========================
+# LINEUP 강화 유틸
+# =========================
+
+def _clean_artist_name(s: str) -> str:
+    s = _strip_space(s)
+    s = re.sub(r'^[\-\–—·\•\▶\✅\[\(]+', '', s)
+    s = re.sub(r'[@\(].*$', '', s)   # 괄호/핸들 이후 삭제
+    s = re.sub(r'[\*\_`]+', '', s)   # 서식문자 제거
+    s = POSTFIX_JOSA.sub('', s)      # 조사 제거
+    s = _strip_space(s)
+    return s
+
+def _looks_like_artist(s: str) -> bool:
+    if not s or len(s) <= 1: return False
+    if any(bad in s for bad in LINEUP_BLACKLIST_SUBSTR): return False
+    if RE_PRICE.search(s) or RE_FULLDATE_OPT_YEAR.search(s): return False
+    if s.count(' ') >= 8 and not s.lower().startswith('dj '):
+        return False
+    return True
+
+def _harvest_names_from_lines(lines: list) -> list:
+    out = []
+    for ln in lines:
+        ln = _strip_space(ln)
+        if not ln: continue
+        m = NAME_CAND.match(ln)
+        if not m: continue
+        name = _clean_artist_name(m.group('name'))
+        if _looks_like_artist(name):
+            out.append(name)
+    return out
+
+def _collect_lines_in_lineup_sections(text: str) -> list:
+    lines = text.splitlines()
+    take = False
+    buf, collected = [], []
+    for ln in lines:
+        if LINEUP_SEC_HEAD.search(ln):
+            if buf: collected.extend(buf); buf=[]
+            take = True
+            continue
+        if take:
+            if SECTION_BREAK.search(ln):
+                take = False
+                if buf: collected.extend(buf); buf=[]
+                continue
+            buf.append(ln)
+    if buf: collected.extend(buf)
+    return collected
+
+def _collect_bullet_lines(text: str) -> list:
+    return [m.group(1) for m in BULLET_LINE.finditer(text)]
+
+def _collect_lines_in_named_section(text: str, head_re: re.Pattern) -> list:
+    lines = text.splitlines()
+    take = False
+    buf, out = [], []
+    for ln in lines:
+        if head_re.search(ln):
+            if buf: out.extend(buf); buf = []
+            take = True
+            continue
+        if take:
+            if (SECTION_BREAK.search(ln) or
+                LINEUP_SEC_HEAD.search(ln) or
+                SECTION_SHOWCASE_HEAD.search(ln) or
+                SECTION_LISTEN_HEAD.search(ln) or
+                SECTION_DJ_HEAD.search(ln)):
+                take = False
+                if buf: out.extend(buf); buf = []
+                continue
+            buf.append(ln)
+    if buf: out.extend(buf)
+    return out
+
+def _extract_lineup_and_handles_linewise_from(text_blocks: List[str]) -> List[tuple]:
+    """주어진 블록들에서 '이름 @handle' 라인을 (name, @handle)로 추출"""
+    pairs = []
+    pat = re.compile(r'^(?P<name>[^@#\|\[\]\(\)]+)\s+(@[A-Za-z0-9._]+)\s*$', re.UNICODE)
+    for block in text_blocks:
+        for ln in block.splitlines():
+            ln = _strip_space(ln)
+            if not ln:
+                continue
+            m = pat.match(ln)
+            if not m:
+                continue
+            name = _clean_artist_name(m.group('name'))
+            handle = m.group(2)
+            if _looks_like_artist(name):
+                pairs.append((name, handle))
+    return pairs
+
+def _pair_name_then_handle(text: str, blocks: List[str]) -> List[tuple]:
+    """
+    '이름' 단독 라인 다음 줄이 '@handle' 인 2줄 패턴을 (name, handle)로 매칭.
+    blocks: 쇼케이스/음감회/일반 라인업 섹션(=DJ 제외) 텍스트 블록 리스트
+    """
+    pairs = []
+    name_pat = re.compile(r'^(?P<name>[^@#\|\[\]\(\)]+?)\s*$', re.UNICODE)
+    handle_pat = re.compile(r'^(@[A-Za-z0-9._]+)\s*$')
+    for block in blocks:
+        lines = [ _strip_space(x) for x in block.splitlines() ]
+        for i, ln in enumerate(lines[:-1]):
+            m1 = name_pat.match(ln)
+            m2 = handle_pat.match(lines[i+1])
+            if not (m1 and m2): 
+                continue
+            name = _clean_artist_name(m1.group('name'))
+            handle = m2.group(1)
+            if _looks_like_artist(name):
+                pairs.append((name, handle))
+    return pairs
+
+def _filter_instagram_handles(text: str, fields: Dict, pairs: List[tuple]) -> None:
+    """라인업 옆 핸들 우선. 없으면 첫 2줄(헤더)의 핸들은 제거"""
+    if pairs:
+        keep = {h for _, h in pairs}
+        fields['INSTAGRAM'] = [h for h in fields.get('INSTAGRAM', []) if h in keep]
+        return
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    header = "\n".join(lines[:2])
+    header_handles = set(re.findall(r'@[A-Za-z0-9._]+', header))
+    fields['INSTAGRAM'] = [h for h in fields.get('INSTAGRAM', []) if h not in header_handles]
+
+def _dj_block_names(text_norm: str) -> set:
+    """정규화 텍스트에서 DJ 섹션 이름 후보 수확(라인업에서 강제 제외용)"""
+    dj_lines = _collect_lines_in_named_section(text_norm, SECTION_DJ_HEAD)
+    names = set(_harvest_names_from_lines(dj_lines))
+    bullet_dj = _collect_bullet_lines("\n".join(dj_lines))
+    names |= set(_harvest_names_from_lines(bullet_dj))
+    return names
+
+def _prefer_longer_unique(items: List[str]) -> List[str]:
+    items = _dedupe([_strip_space(x) for x in items if x])
+    keep = []
+    for i, a in enumerate(items):
+        if any((a != b) and (a in b) for b in items):
+            continue
+        keep.append(a)
+    return keep
+
+# =========================
 # 규칙 본체
 # =========================
 
 def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
+    # 통화 표기 선정규화
+    text = re.sub(r'\bKRW\b', '원', text, flags=re.IGNORECASE).replace('₩','원').replace('￦','원')
+
     price = list(fields.get('PRICE', []) or [])
     onsite = list(fields.get('PRICE_ONSITE', []) or [])
 
     def tok_span_to_str(i, j):
-        return _strip_space(''.join(tokens[i:j]))  # "3 만 5 천 원" -> "3만5천원"
+        return _strip_space(''.join(tokens[i:j]))
 
     def pick_best_amount(slices: List[str]) -> Optional[str]:
         best = None; best_val = -1
         for cand in slices:
-            v = _parse_kr_price(cand)
-            if not v and RE_PRICE.fullmatch(_strip_space(cand or '')):
-                v = _normalize_price(cand)
+            s = _strip_space(cand)
+            s = re.sub(r'\bKRW\b', '원', s, flags=re.IGNORECASE).replace('₩','원').replace('￦','원')
+            v = _parse_kr_price(s)
+            if not v and RE_PRICE.fullmatch(_strip_space(s or '')):
+                v = _normalize_price(s)
             if v:
                 val = _price_to_int(v)
                 if val > best_val:
@@ -228,7 +520,6 @@ def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
             candidates = [tok_span_to_str(i+1, j+1) for j in range(i+1, min(i+6, len(tokens)))]
             best = pick_best_amount(candidates)
             if best: price.append(best)
-
         if tk in ('현매', '현장'):
             candidates = [tok_span_to_str(i+1, j+1) for j in range(i+1, min(i+6, len(tokens)))]
             best = pick_best_amount(candidates)
@@ -237,12 +528,12 @@ def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
     # B) 텍스트 앵커 보조
     for m in re.finditer(r'(예매)', text):
         win = _window_after(text, m.end(), 60)
-        words = re.findall(r'[0-9가-힣,]+원?|[0-9가-힣,]+', win)
+        words = re.findall(r'[0-9가-힣,]+(?:\s*(?:KRW|원))?|[0-9가-힣,]+', win, flags=re.IGNORECASE)
         best = pick_best_amount(words)
         if best: price.append(best)
     for m in re.finditer(r'(현매|현장)', text):
         win = _window_after(text, m.end(), 60)
-        words = re.findall(r'[0-9가-힣,]+원?|[0-9가-힣,]+', win)
+        words = re.findall(r'[0-9가-힣,]+(?:\s*(?:KRW|원))?|[0-9가-힣,]+', win, flags=re.IGNORECASE)
         best = pick_best_amount(words)
         if best: onsite.append(best)
 
@@ -267,18 +558,13 @@ def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
     fields['PRICE_ONSITE'] = clean_prices(onsite)
 
 def _ticket_open_mapping(text: str, fields: Dict) -> None:
-    """
-    '티켓은 … 오픈' 포함 다양한 변형에서
-    '오픈' 앵커에 가장 가까운 날짜/시간을 선택.
-    너무 멀리 떨어진(> 80자) 후보는 버림.
-    """
     opens = list(RE_TICKET_OPEN.finditer(text))
-    if not opens: 
+    if not opens:
         fields['TICKET_OPEN_DATE'] = _dedupe(fields.get('TICKET_OPEN_DATE', []))
         fields['TICKET_OPEN_TIME'] = _dedupe(fields.get('TICKET_OPEN_TIME', []))
         return
 
-    all_dates = _find_dates_with_span(text)  # [(txt, s, e)]
+    all_dates = _find_dates_with_span(text)
     all_times = _find_times_with_span(text)
 
     to_dates, to_times = [], []
@@ -289,7 +575,7 @@ def _ticket_open_mapping(text: str, fields: Dict) -> None:
         best_d, best = 10**9, None
         for dtxt, ds, de in all_dates:
             dist = min(abs(anchor - ds), abs(anchor - de))
-            if dist < best_d and dist <= 80:  # 80자 이내만 허용
+            if dist < best_d and dist <= 80:
                 best_d, best = dist, dtxt
         if best: 
             to_dates.append(best)
@@ -306,31 +592,54 @@ def _ticket_open_mapping(text: str, fields: Dict) -> None:
     fields['TICKET_OPEN_DATE'] = _dedupe(to_dates)
     fields['TICKET_OPEN_TIME'] = _dedupe(to_times)
 
-
 def _filter_lineup(fields: Dict, lexicons: Optional[Dict]=None, text: Optional[str]=None) -> None:
+    """모델 후보 + (섹션/불릿/서술형/사전) 기반 라인업 보강. DJ 섹션 제외."""
     lineup = fields.get('LINEUP', []) or []
     out = []
-    # 1) 모델이 준 후보 정리
+
     for x in lineup:
-        s = _strip_josa(x)
-        if not s or len(s) <= 1: continue
-        if s in LINEUP_STOPWORDS: continue
-        if s in ('!',',','/','(',')','·','-','—'): continue
-        if RE_PRICE.search(s): continue
-        if RE_FULLDATE_OPT_YEAR.search(s): continue
-        if s.startswith('@') or re.fullmatch(r'[A-Za-z가-힣·\s]+', s):
+        s = _clean_artist_name(x)
+        if _looks_like_artist(s):
             out.append(s)
 
-    # 2) 아티스트 사전으로 텍스트에서 보강
-    if lexicons and text:
-        for name in lexicons.get('artists', []):
-            # 공백/대소문자 무시 매칭
-            pat = re.compile(re.escape(name), re.IGNORECASE)
-            if pat.search(text):
-                out.append(name)
+    if text:
+        sc_lines = _collect_lines_in_named_section(text, SECTION_SHOWCASE_HEAD)
+        ls_lines = _collect_lines_in_named_section(text, SECTION_LISTEN_HEAD)
+        dj_lines = _collect_lines_in_named_section(text, SECTION_DJ_HEAD)
 
+        out += _harvest_names_from_lines(sc_lines)
+        out += _harvest_names_from_lines(ls_lines)
+
+        sec_lines = _collect_lines_in_lineup_sections(text)
+        sec_names = _harvest_names_from_lines(sec_lines)
+        dj_names = set(_harvest_names_from_lines(dj_lines))
+        sec_names = [n for n in sec_names if n not in dj_names]
+        out += sec_names
+
+        bullet_all = _collect_bullet_lines(text)
+        bullet_dj  = _collect_bullet_lines("\n".join(dj_lines))
+        bullet_lines = [b for b in bullet_all if b not in bullet_dj]
+        out += _harvest_names_from_lines(bullet_lines)
+
+        for m in re.finditer(r'(?:한국팀|국내팀|게스트)\s*으로는\s*([^\n]+?)가\s*(?:같이|함께)\s*합니다', text):
+            cand = _clean_artist_name(m.group(1))
+            if _looks_like_artist(cand):
+                out.append(cand)
+
+        sc_ls_block = '\n'.join(sc_lines + ls_lines + sec_lines)
+        for m in re.finditer(r'^\s*(.+?)\s*\([^)]+\)\s*$', sc_ls_block, flags=re.MULTILINE):
+            cand = _clean_artist_name(m.group(1))
+            if _looks_like_artist(cand):
+                out.append(cand)
+
+        if lexicons and lexicons.get('artists'):
+            safe_blocks = sc_ls_block
+            for name in lexicons['artists']:
+                if re.search(re.escape(name), safe_blocks, flags=re.IGNORECASE):
+                    out.append(name)
+
+    out = [s for s in (_strip_space(x) for x in out) if _looks_like_artist(s)]
     fields['LINEUP'] = _dedupe(out)
-
 
 def _fix_instagram(fields: Dict) -> None:
     inst = list(fields.get('INSTAGRAM', []) or [])
@@ -338,26 +647,22 @@ def _fix_instagram(fields: Dict) -> None:
         if x.startswith('@'): inst.append(x)
     fields['INSTAGRAM'] = _dedupe(inst)
 
-def _prefer_longer_unique(items: List[str]) -> List[str]:
-    items = _dedupe([_strip_space(x) for x in items if x])
-    keep = []
-    for i, a in enumerate(items):
-        if any((a != b) and (a in b) for b in items):
-            # a가 b에 포함되면(부분 문자열) 버림
-            continue
-        keep.append(a)
-    return keep
-
 def _fix_venues(text: str, fields: Dict, lexicons: Optional[Dict]=None) -> None:
+    def _is_blacklisted(v: str) -> bool:
+        return any(w in v for w in VENUE_BLACKLIST_WORDS)
+
     venues = [_clean_venue_token(v) for v in (fields.get('VENUE', []) or [])]
     venues = _combine_area_and_venue(text, venues)
+
     for m in re.finditer(r'([가-힣A-Za-z·0-9]+)(?:에서|에)\b', text):
         w = _clean_venue_token(m.group(1))
+        if _is_blacklisted(w):
+            continue
         if _is_probable_venue_word(w):
             venues.append(w)
-    fields['VENUE'] = _dedupe([_strip_space(v) for v in venues if v])
-    cand = [_strip_space(v) for v in venues if v]
-    fields['VENUE'] = _prefer_longer_unique(cand)
+
+    venues = [_strip_space(v) for v in venues if v and not _is_blacklisted(v)]
+    fields['VENUE'] = _prefer_longer_unique(_dedupe(venues))
 
 def _normalize_dates(tokens: List[str], text: str, fields: Dict) -> None:
     dates = list(fields.get('DATE', []) or [])
@@ -368,7 +673,7 @@ def _normalize_dates(tokens: List[str], text: str, fields: Dict) -> None:
 def _normalize_times(text: str, fields: Dict) -> None:
     times = list(fields.get('TIME', []) or [])
     times.extend(_find_all_times(text))
-    fields['TIME'] = _dedupe([_normalize_time(t) for t in times])
+    fields['TIME'] = _dedupe([_strip_space(t) for t in times])
 
 def _final_tidy(fields: Dict) -> None:
     if 'PRICE_TYPE' in fields and fields['PRICE_TYPE']:
@@ -383,7 +688,6 @@ def _final_tidy(fields: Dict) -> None:
         elif isinstance(v, str):
             fields[k] = _strip_space(v)
 
-# 날짜 정합성 체크
 def _is_valid_full_or_partial_date(s: str) -> bool:
     return bool(RE_FULLDATE_OPT_YEAR.fullmatch(s))
 
@@ -395,29 +699,99 @@ def _sanitize_ticket_open(fields: Dict) -> None:
             tod.append(d)
     fields['TICKET_OPEN_DATE'] = _dedupe(tod)
 
+# =========================
+# 본체
+# =========================
+
 def apply_regex_postrules(
     text: str,
     tokens: List[str],
     fields: Dict[str, List[str]],
     lexicons: Optional[Dict]=None
 ) -> Dict[str, List[str]]:
-    """
-    규칙 기반 후처리의 본체
-    """
-    _normalize_dates(tokens, text, fields)
-    _normalize_times(text, fields)
-    _ticket_open_mapping(text, fields)
-    _rescan_and_fix_prices(text, tokens, fields)
-    _filter_lineup(fields, lexicons=lexicons, text=text)
+    """규칙 기반 후처리의 본체"""
+    # 섹션/불릿 인식을 위해 정규화 텍스트 사용
+    t = _to_ascii_compat(text)
+
+    # 섹션 수집(정규화 텍스트 기준)
+    sc_lines = _collect_lines_in_named_section(t, SECTION_SHOWCASE_HEAD)
+    ls_lines = _collect_lines_in_named_section(t, SECTION_LISTEN_HEAD)
+    dj_lines = _collect_lines_in_named_section(t, SECTION_DJ_HEAD)
+    sec_lines = _collect_lines_in_lineup_sections(t)
+
+    # 먼저 '이름 @handle' (DJ 제외 블록만)
+    allowed_blocks = ['\n'.join(sc_lines), '\n'.join(ls_lines), '\n'.join(sec_lines)]
+    pairs_same_line = _extract_lineup_and_handles_linewise_from(allowed_blocks)  # '이름 @핸들' 한 줄
+    pairs_two_lines = _pair_name_then_handle(t, allowed_blocks)                  # '이름' ↵ '@핸들'
+    pairs = _dedupe(pairs_same_line + pairs_two_lines)
+
+    if pairs:
+        fields.setdefault('LINEUP', [])
+        fields.setdefault('INSTAGRAM', [])
+        for name, handle in pairs:
+            fields['LINEUP'].append(name)
+            fields['INSTAGRAM'].append(handle)
+        fields['LINEUP'] = _dedupe(fields['LINEUP'])
+        fields['INSTAGRAM'] = _dedupe(fields['INSTAGRAM'])
+
+    # 인스타 핸들 정리(헤더 핸들 제거/라인업 옆 핸들 유지) — 원문 기준
+    _filter_instagram_handles(text, fields, pairs)
+
+    # 날짜/시간/가격/오픈 (정규화 텍스트 t 기준)
+    _normalize_dates(tokens, t, fields)
+    _normalize_times(t, fields)
+    # START 시간만 남기기 (있다면)
+    fields['TIME'] = _pick_start_time_only(t, fields.get('TIME', []))
+    _ticket_open_mapping(t, fields)
+    _rescan_and_fix_prices(t, tokens, fields)
+
+    # 라인업 보강 (DJ 제외)
+    def _harvest_excluding_dj():
+        out = []
+        out += _harvest_names_from_lines(sc_lines)
+        out += _harvest_names_from_lines(ls_lines)
+        sec_names = _harvest_names_from_lines(sec_lines)
+        out += sec_names
+        bullet_all = _collect_bullet_lines(t)
+        bullet_dj  = _collect_bullet_lines('\n'.join(dj_lines))
+        bullet_lines = [b for b in bullet_all if b not in bullet_dj]
+        out += _harvest_names_from_lines(bullet_lines)
+        return out
+
+    lineup = fields.get('LINEUP', []) or []
+    lineup += _harvest_excluding_dj()
+
+    # 사전 매칭 — DJ 제외 블록에만 적용
+    if lexicons and lexicons.get('artists'):
+        safe_blocks = '\n'.join(allowed_blocks)
+        for name in lexicons['artists']:
+            if re.search(re.escape(name), safe_blocks, flags=re.IGNORECASE):
+                lineup.append(name)
+
+    # DJ 블록 이름 강제 제거
+    dj_names = _dj_block_names(t)
+    lineup = [n for n in map(_strip_space, lineup) if _looks_like_artist(n) and n not in dj_names]
+    fields['LINEUP'] = _dedupe(lineup)
+
+    # TITLE 비었으면 헤더에서 보강
+    if not fields.get('TITLE'):
+        t_title = _extract_title_from_head(text)
+        if t_title:
+            fields['TITLE'] = [t_title]
+
+    # VENUE/마무리
     _fix_instagram(fields)
-    _fix_venues(text, fields, lexicons=lexicons)
+    _fix_venues(t, fields, lexicons=lexicons)
     _sanitize_ticket_open(fields)
     _tidy_title(fields)
     _final_tidy(fields)
+    # 날짜 + 요일 합치기
+    if fields.get("DATE"):
+        fields["DATE"] = _merge_date_with_weekday(fields["DATE"])
     return fields
 
 # =========================
-# BIO/스키마/렉시콘 유틸 (apply_rules.py에서 import)
+# BIO/스키마/렉시콘 유틸
 # =========================
 
 def _bio_to_spans(tokens: List[str], labels: List[str]) -> List[Tuple[str,int,int]]:
@@ -488,7 +862,7 @@ def _fields_from_bio(tokens: List[str], labels: List[str]) -> Dict[str, List[str
     return fields
 
 def load_lexicons(artists_csv: Optional[str]=None, venues_csv: Optional[str]=None) -> Dict[str, set]:
-    """CSV에서 아티스트/공연장 사전 로드. 한 열에 하나씩 적혀 있다고 가정."""
+    """CSV에서 아티스트/공연장 사전 로드. 한 열에 하나씩."""
     def load_csv(path: Optional[str]) -> set:
         bag = set()
         if not path: return bag
@@ -524,7 +898,6 @@ def merge_model_and_rules(
     lexicons: Optional[Dict] = None
 ) -> Dict:
     """
-    apply_rules.py에서 사용하는 진입점.
     1) 모델 BIO에 임계치 적용
     2) BIO → fields
     3) 텍스트 조립 후 regex 기반 후처리
@@ -539,14 +912,38 @@ def merge_model_and_rules(
     final["text"] = text
     return schema_guard(final)
 
-
 # =========================
 # (선택) 셀프 테스트
 # =========================
 if __name__ == "__main__":
-    text = "2025년 9월 21일(일) 오후 6시, 홍대 롤링홀에서 김오키, CADEJO(@cadejo___) 출연! 티켓은 2025년 8월 25일(월) 낮 12시 오픈, 예매 3만원 / 현장 3만5천원!"
-    tokens = ['2025년','9월','21일','(일)','오후 6시',',','홍대','롤링홀에서','김오키',',','CADEJO','(','@cadejo___',')','출연','!','티켓은','2025년','8월','25일','(월)','낮 12시','오픈',',','예매','3','만원','/','현장','3','만','5','천원','!']
-    labels = ['B-DATE','I-DATE','I-DATE','O','B-TIME','O','B-VENUE','O','B-LINEUP','O','B-LINEUP','O','B-INSTAGRAM','O','O','O','O','B-DATE','I-DATE','I-DATE','O','B-TIME','O','O','O','B-PRICE','O','B-PRICE_TYPE','B-PRICE','O','B-PRICE','O']
-    merged = merge_model_and_rules(tokens, labels)
+    text = """
+Night Of Victim Vol.63
+
+The Redemptions
+@band_the_redemptions
+Nimbus
+@nimbus_grunge
+Guny N Guns
+@guny_n_guns
+Varnish
+@varnish_band
+
+2025. 8. 17.(일)
+Club VICTIM
+OPEN 18:00
+START 18:30
+25,000 KRW
+
+i 현매만 가능(계좌이체, 카드가능)
+ii 외부 음식 반입가능, 외부주류 반입금지
+
+문의
+DM or clubxvictim@gmail.com
+
+Special Thanx to @coszise
+"""
+    toks = text.split()
+    labels = ['O'] * len(toks)
+    merged = merge_model_and_rules(toks, labels)
     from pprint import pprint
     pprint(merged)

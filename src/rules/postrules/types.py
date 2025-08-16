@@ -1,0 +1,1 @@
+# 공통 타입(Span, Candidate, RuleOptions)

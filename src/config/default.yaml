@@ -1,19 +1,28 @@
 # src/config/default.yaml
-# 하이퍼파라미터/경로 설정
+
+# 재현성을 위한 시드 값
 seed: 42
+
+# 경로 설정
 paths:
-  raw: data/raw/최종_학습데이터셋_clean.txt
-  processed_dir: data/processed
-  output_dir: outputs/models/koelectra_crf
+  raw: data/raw/최종_학습데이터셋_clean.txt   # 원본 BIO 학습 데이터 경로
+  processed_dir: data/processed               # 전처리 후 데이터 저장 폴더
+  output_dir: outputs/models/koelectra_crf    # 학습된 모델 저장 경로
+
+# 모델 설정
 model:
-  backbone: monologg/koelectra-small-discriminator
-  max_len: 256
+  backbone: monologg/koelectra-small-discriminator  # KoELECTRA 백본
+  max_len: 256                                      # 입력 토큰 최대 길이
+
+# 학습 파라미터
 train:
-  batch_size: 16
-  lr: 3e-5
-  epochs: 6
-  warmup_ratio: 0.1
-  weight_decay: 0.01
-  grad_clip: 1.0
+  batch_size: 16        # 배치 사이즈
+  lr: 3e-5              # 학습률
+  epochs: 6             # 학습 에폭 수
+  warmup_ratio: 0.1     # Warmup 비율
+  weight_decay: 0.01    # L2 정규화
+  grad_clip: 1.0        # Gradient clipping
+
+# 평가 설정
 eval:
-  eval_steps: 200
+  eval_steps: 200       # 몇 스텝마다 평가할지

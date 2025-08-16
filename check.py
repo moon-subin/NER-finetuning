@@ -1,4 +1,4 @@
-from src.rules.regex_postrules import _label_threshold
+from src.rules.postrules import _label_threshold
 ths = {"DATE":0.75,"default":0.5}
 print("_label_threshold('B-DATE') =>", _label_threshold("B-DATE", ths))
 print("_label_threshold('I-DATE') =>", _label_threshold("I-DATE", ths))

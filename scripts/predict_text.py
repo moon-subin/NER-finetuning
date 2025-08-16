@@ -2,16 +2,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-한 줄 텍스트 → NER 예측(+confidence) → thresholds + 규칙 적용 → 최종 fields 출력
+텍스트 파일 → NER 예측(+confidence) → (옵션) thresholds + 규칙 적용 → 최종 fields 출력
 
 예)
-  python scripts/predict_text.py ^
-    --model_dir outputs/models/koelectra_crf ^
-    --text "2025년 6월 26일 저녁 7시 유인원 단독 콘서트 Our Nature, 예매 30,000원 현매 35,000원" ^
-    --thresholds outputs/thresholds.json ^
-    --artists_csv data/lexicon/artists.csv ^
-    --venues_csv data/lexicon/venues.csv ^
-    --save_jsonl outputs/predictions/custom_text.jsonl
+python scripts/predict_text.py `
+--model_dir outputs/models/koelectra_crf `
+--text_file input.txt `
+--thresholds outputs/thresholds.json `
+--artists_csv data/lexicon/artists.csv `
+--venues_csv data/lexicon/venues.csv `
+--rules on `
+--out outputs/pred.json
 """
 
 import os, sys, io, re, json, argparse
@@ -26,45 +27,70 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoConfig
 
 from src.models.koelectra_crf import ElectraCRF
-from src.rules.regex_postrules import merge_model_and_rules, schema_guard, load_lexicons
+from src.rules.postrules import merge_model_and_rules, schema_guard, load_lexicons
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 간이 토크나이저 (공연 공지 특화)
+# ─────────────────────────────────────────────────────────────────────────────
 def simple_tokenize(text: str):
-    """
-    한국 공연 공지 특화 간이 토크나이저:
-    - 가격: 30,000원 / 45,000원
-    - 날짜: 2025년 / 9월 / 21일 / (일)
-    - 시간: 오전/오후/낮/밤/저녁/새벽 + '숫자시(분)' 또는 12:30
-    - @handle, 영문/한글 단어, 구두점
-    """
-    text = re.sub(r"\s+", " ", text.strip())
+    text = re.sub(r"\s+", " ", (text or "").strip())
 
-    price = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:원)?"
-    weekday_paren = r"\([월화수목금토일]\)"
-    time_units = r"(?:(?:오전|오후|낮|밤|저녁|새벽)\s*\d{1,2}시(?:\s*\d{1,2}분)?|\d{1,2}:\d{2}|\d{1,2}시(?:\s*\d{1,2}분)?)"
-    date_units = r"(?:\d{4}년|\d{1,2}월|\d{1,2}일)"
-
-    token_re = re.compile(
-        rf"{weekday_paren}|{time_units}|{date_units}|{price}|@[A-Za-z0-9_.]+|[A-Za-z]+|[가-힣]+|\d+|[^\sA-Za-z0-9가-힣]",
-        re.UNICODE
+    price = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\s*(?:원|won|KRW))?"
+    weekday_paren = r"\((?:[월화수목금토일]|Mon|Tue|Wed|Thu|Fri|Sat|Sun|MON|TUE|WED|THU|FRI|SAT|SUN)\)"
+    time_units = (
+        r"(?:(?:오전|오후|낮|밤|저녁)\s*\d{1,2}시(?:\s*\d{1,2}분)?"
+        r"|\d{1,2}:\d{2}(?:\s*(?:am|pm|AM|PM))?"
+        r"|\d{1,2}\s*(?:am|pm|AM|PM)"
+        r"|\d{1,2}시(?:\s*\d{1,2}분)?)"
+    )
+    date_units = (
+        r"(?:\d{4}년|\d{1,2}월|\d{1,2}일"
+        r"|\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}"
+        r"|\d{1,2}\s*\.\s*\d{1,2}"
+        r"|\d{4}/\d{1,2}/\d{1,2}"
+        r"|\d{1,2}/\d{1,2})"
     )
 
+    # 통화 기호(₩/￦)와 KRW 단어를 분리 토큰으로 인식
+    token_re = re.compile(
+        rf"{weekday_paren}|{time_units}|{date_units}|{price}|[₩￦]|KRW|@[A-Za-z0-9_.]+|#[^\s#@]+|[A-Za-z]+|[가-힣]+|\d+|[^\sA-Za-z0-9가-힣]",
+        re.UNICODE
+    )
     toks = token_re.findall(text)
 
-    # '35,000' '원' → '35,000원' 결합
     merged = []
     i = 0
     while i < len(toks):
         t = toks[i]
-        if i + 1 < len(toks) and toks[i+1] == "원" and re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)", t):
-            merged.append(t + "원")
+
+        # 앞에 통화기호가 오고 뒤에 숫자면 결합: '₩' '25,000' -> '25,000원'
+        if t in ('₩','￦') and i + 1 < len(toks) and re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)", toks[i+1]):
+            merged.append(toks[i+1] + "원")
             i += 2
             continue
+
+        # '25,000' + ('원'|'won'|'KRW') -> '25,000원'
+        if i + 1 < len(toks) and toks[i+1].upper() in ("원".upper(), "WON", "KRW"):
+            if re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)", t):
+                merged.append(t + "원")
+                i += 2
+                continue
+
+        # '3' '만' '5' '천원' -> '3만5천원'  (천원/원 모두 커버)
+        if i + 3 < len(toks) and toks[i+1] == "만" and re.fullmatch(r"\d+", toks[i]) and re.fullmatch(r"\d+", toks[i+2]):
+            if toks[i+3].endswith("원"):
+                merged.append(f"{toks[i]}만{toks[i+2]}천원")
+                i += 4
+                continue
+
         merged.append(t)
         i += 1
     return merged
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 모델 라벨 로딩
+# ─────────────────────────────────────────────────────────────────────────────
 def load_labels_from_model_dir(model_dir: str):
     # 1) label_map.json
     p1 = os.path.join(model_dir, "label_map.json")
@@ -83,13 +109,15 @@ def load_labels_from_model_dir(model_dir: str):
     cfg = AutoConfig.from_pretrained(model_dir)
     if getattr(cfg, "id2label", None):
         id2 = cfg.id2label
-        # id2가 dict일 수 있으므로 index 순서 보장
         if isinstance(id2, dict):
             return [id2[str(i)] if str(i) in id2 else id2[i] for i in range(len(id2))]
         return [id2[i] for i in range(len(id2))]
     raise RuntimeError(f"labels not found under {model_dir}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 토큰 → WordPiece 변환 & 역정렬
+# ─────────────────────────────────────────────────────────────────────────────
 def tokens_to_wp(tokenizer, tokens, max_len: int):
     ids = [tokenizer.cls_token_id]
     align = [-1]
@@ -120,16 +148,92 @@ def decode_wp(label_ids, align, id2label):
     return lab_by_token
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# (rules off용) BIO → fields 간단 변환
+# ─────────────────────────────────────────────────────────────────────────────
+def _bio_to_spans(tokens, labels):
+    spans = []
+    cur_type, s = None, None
+    for i, lab in enumerate(labels):
+        if not lab or lab == "O":
+            if cur_type is not None:
+                spans.append((cur_type, s, i))
+                cur_type, s = None, None
+            continue
+        if "-" in lab:
+            tag, etype = lab.split("-", 1)
+        else:
+            tag, etype = lab, None
+        if tag == "B":
+            if cur_type is not None:
+                spans.append((cur_type, s, i))
+            cur_type, s = etype, i
+        elif tag == "I":
+            if cur_type != etype:
+                if cur_type is not None:
+                    spans.append((cur_type, s, i))
+                cur_type, s = etype, i
+        else:
+            if cur_type is not None:
+                spans.append((cur_type, s, i))
+            cur_type, s = None, None
+    if cur_type is not None:
+        spans.append((cur_type, s, len(labels)))
+    return spans
+
+
+def _fields_from_bio(tokens, labels):
+    fields = {
+        "TITLE": [], "DATE": [], "TIME": [],
+        "PRICE": [], "PRICE_ONSITE": [], "PRICE_TYPE": [],
+        "LINEUP": [], "INSTAGRAM": [],
+        "VENUE": [], "V_INSTA": [],
+        "TICKET_OPEN_DATE": [], "TICKET_OPEN_TIME": []
+    }
+    spans = _bio_to_spans(tokens, labels)
+    def join(a, b): return " ".join(tokens[a:b]).strip()
+    for etype, s, e in spans:
+        txt = join(s, e)
+        if not txt: continue
+        if   etype == 'PRICE':              fields['PRICE'].append(txt)
+        elif etype == 'PRICE_ONSITE':       fields['PRICE_ONSITE'].append(txt)
+        elif etype == 'PRICE_TYPE':         fields['PRICE_TYPE'].append(txt)
+        elif etype == 'LINEUP':             fields['LINEUP'].append(txt)
+        elif etype == 'INSTAGRAM':          fields['INSTAGRAM'].append(txt)
+        elif etype == 'VENUE':              fields['VENUE'].append(txt)
+        elif etype == 'V_INSTA':            fields['V_INSTA'].append(txt)
+        elif etype == 'TICKET_OPEN_DATE':   fields['TICKET_OPEN_DATE'].append(txt)
+        elif etype == 'TICKET_OPEN_TIME':   fields['TICKET_OPEN_TIME'].append(txt)
+        elif etype == 'DATE':               fields['DATE'].append(txt)
+        elif etype == 'TIME':               fields['TIME'].append(txt)
+        elif etype == 'TITLE':              fields['TITLE'].append(txt)
+    return fields
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 메인
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_dir", required=True)
-    ap.add_argument("--text", required=True)
+    ap.add_argument("--text_file", required=True, help="분석할 텍스트 파일 경로")
     ap.add_argument("--thresholds", default=None, help="thresholds.json 경로(없으면 규칙만 적용)")
     ap.add_argument("--artists_csv", default=None)
     ap.add_argument("--venues_csv", default=None)
     ap.add_argument("--max_len", type=int, default=256)
     ap.add_argument("--save_jsonl", default=None, help="RAW 예측(jsonl) 저장 경로(옵션)")
+    ap.add_argument("--rules", choices=["on", "off"], default="on",
+                    help="정규표현식/사전 후처리 사용 여부 (default: on)")
+    ap.add_argument("--out", default=None, help="최종 JSON 결과를 파일로 저장")
     args = ap.parse_args()
+
+    # 입력 텍스트 로드
+    if not os.path.exists(args.text_file):
+        raise FileNotFoundError(f"--text_file not found: {args.text_file}")
+    with io.open(args.text_file, "r", encoding="utf-8") as f:
+        raw_text = f.read()
+    if raw_text is None or not str(raw_text).strip():
+        raise ValueError("입력 파일이 비어있습니다.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -157,7 +261,7 @@ def main():
     model.eval()
 
     # tokenize input text
-    tokens = simple_tokenize(args.text)
+    tokens = simple_tokenize(raw_text)
     input_ids, attn, align = tokens_to_wp(tokenizer, tokens, max_len=args.max_len)
     input_ids = input_ids.unsqueeze(0).to(device)
     attn      = attn.unsqueeze(0).to(device)
@@ -196,7 +300,7 @@ def main():
                 "tokens": tokens,
                 "model_labels": pred_labels,
                 "confidences": conf_token,
-                "text": args.text,
+                "text": raw_text,
             }
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
@@ -207,20 +311,49 @@ def main():
             got = json.load(f)
         thresholds = got.get("thresholds", got)  # {"DATE":0.5,...} or plain dict
 
-    lex = load_lexicons(args.artists_csv, args.venues_csv)
-    merged = merge_model_and_rules(tokens, pred_labels, conf_token, thresholds, lexicons=lex)
-    clean  = schema_guard(merged)
+    if args.rules == "on":
+        lex = load_lexicons(args.artists_csv, args.venues_csv)
+        merged = merge_model_and_rules(tokens, pred_labels, conf_token, thresholds, lexicons=lex)
+        clean  = schema_guard(merged)
+    else:
+        # thresholds만 적용하고 BIO 그대로 출력
+        def _apply_thresholds(labels_, confs_, thr_):
+            if not confs_: return labels_
+            out = []
+            for lab, conf in zip(labels_, confs_):
+                if not lab or lab == 'O':
+                    out.append('O'); continue
+                etype = lab.split('-', 1)[-1] if '-' in lab else lab
+                t = float(thr_.get(etype, 0.0)) if isinstance(thr_, dict) else 0.0
+                keep = (conf is None) or (float(conf) >= t)
+                out.append(lab if keep else 'O')
+            return out
+
+        labels_thr = _apply_thresholds(pred_labels, conf_token, thresholds)
+        fields = _fields_from_bio(tokens, labels_thr)
+        fields["tokens"] = tokens
+        fields["text"] = " ".join(tokens)
+        clean = schema_guard(fields)
 
     # 출력
-    print("\n=== INPUT TEXT ===")
-    print(args.text)
+    print("\n=== INPUT FILE ===")
+    print(args.text_file)
+    print("\n=== INPUT TEXT (first 300 chars) ===")
+    preview = raw_text[:300].replace("\n", " ")
+    print(preview + ("..." if len(raw_text) > 300 else ""))
     print("\n=== TOKENS ===")
     print(tokens)
     print("\n=== MODEL PRED (token-level) ===")
     print(list(zip(tokens, pred_labels, [round(c,3) for c in conf_token])))
 
-    print("\n=== FINAL FIELDS (after thresholds + rules) ===")
-    print(json.dumps(clean, ensure_ascii=False, indent=2))
+    print("\n=== FINAL FIELDS (after thresholds {} rules) ===".format("+" if args.rules=="on" else "without"))
+    result_str = json.dumps(clean, ensure_ascii=False, indent=2)
+    print(result_str)
+
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with io.open(args.out, "w", encoding="utf-8") as f:
+            f.write(result_str)
 
 
 if __name__ == "__main__":
