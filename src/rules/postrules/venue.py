@@ -35,6 +35,25 @@ def _fix_venues(text: str, fields: Dict, lexicons: Optional[Dict]=None) -> None:
         if _is_probable_venue_word(w): venues.append(w)
 
     venues = [_strip_space(v) for v in venues if v and not _is_blacklisted(v)]
+    # NEW(narrowed): "@ Alleyway Taphouse, Suwon" 같은 라인만 수확
+    #  - "@ " (공백)으로 시작해야 함 (순수 핸들 "@username" 배제)
+    #  - 장소 키워드가 있거나, 쉼표가 포함된 지명형식일 때만 수용
+    for ln in text.splitlines():
+        raw = ln.strip()
+        if not raw.startswith('@ '):
+            continue
+        seg = raw[2:].strip()  # "@ " 제거
+        # 장식/부가정보 제거
+        seg = seg.split('~')[0]
+        seg = seg.split('(')[0]
+        seg = seg.rstrip(',').strip()
+        # 안전장치: 키워드 또는 쉼표(지역 구분) 필요
+        if not seg:
+            continue
+        if not (_is_probable_venue_word(seg) or (',' in seg)):
+            continue
+        if not _is_blacklisted(seg):
+            venues.append(seg)
     m = re.search(
         r'^\s*(?:[•●◦▪️\-\–\—✦❏]\s*)*(?:Venue|VENUE|장소)\s*[:：]\s*([^\n(]+)',
         text,

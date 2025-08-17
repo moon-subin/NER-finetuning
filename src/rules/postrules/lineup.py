@@ -14,7 +14,12 @@ TIMETABLE_LINE = re.compile(
 NAME_RE = re.compile(
     r'^\s*(?P<name>(?:DJ\s+)?[A-Za-z][A-Za-z0-9 .\'’\-\&\*/:+_]{1,60}|[가-힣0-9·]+(?:\s[가-힣0-9·]+){0,6})\s*$'
 )
-
+BI_NAME_LINE = re.compile(  # "English / 한글" 혹은 "English/한글"
+    r'^\s*(?P<en>[A-Za-z0-9 .\'’\-&:_]{2,60})\s*/\s*[가-힣0-9 .\'’\-&:_]{1,60}\s*$'
+)
+BI_NAME_RE = re.compile(  # NEW: "English / 한글" or "English/한글"
+    r'^\s*(?P<en>[A-Za-z0-9 .\'’\-&:_]{2,60})\s*/\s*[가-힣0-9 .\'’\-&:_]{1,60}\s*$'
+)
 LINEUP_BLACKLIST_SUBSTR = {
     '오픈','티켓','문의','입장','가격','현매','예매','공지','안내',
     '라이브홀','클럽','홀','극장','페스티벌','장소','일시','시간표','타임테이블'
@@ -124,6 +129,18 @@ def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     pairs += _pairs_from_with_block(text)
     pairs += _pairs_from_same_line(text)
+    # NEW: 바이링궐 라인을 전역에서 수확 (핸들 없어도 이름만 라인업으로)
+    for ln in (x.strip() for x in text.splitlines()):
+        if not ln or ln.startswith('#') or ln.startswith('@'): 
+            continue
+        # 문장성 안내문 배제
+        if re.search(r'(Doors\s+open|FREE\s*entrance|admission|공연\s*시작)', ln, flags=re.IGNORECASE):
+            continue
+        m = BI_NAME_LINE.match(ln)
+        if m:
+            name = _clean_artist_name(m.group('en'))
+            if _looks_like_artist(name):
+                pairs.append((name, None))
     # 다음 줄 패턴: NAME ↵ @handle
     lines = [l for l in (x.strip() for x in text.splitlines()) if l != ""]
     for i in range(len(lines) - 1):
@@ -145,6 +162,7 @@ def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
 def harvest_lineup_names(text: str) -> List[str]:
     """
     보수적으로: with ~ [공연 정보] 구간 + 타임테이블에서만 라인업 수확
+    "영문 / 한글" 이중 표기 라인도 영문을 우선 수확
     """
     names: List[str] = []
     # 타임테이블 먼저
@@ -166,6 +184,13 @@ def harvest_lineup_names(text: str) -> List[str]:
                 break
             if HANDLE_ANYWHERE_RE.search(raw):
                 raw = re.sub(HANDLE_ANYWHERE_RE, '', raw)
+            # NEW: bilingual "EN / KO" → EN 우선
+            bm = BI_NAME_RE.match(raw)
+            if bm:
+                cand = _clean_artist_name(bm.group('en'))
+                if _looks_like_artist(cand):
+                    names.append(cand)
+                continue
             cand = _clean_artist_name(raw)
             if _looks_like_artist(cand):
                 names.append(cand)

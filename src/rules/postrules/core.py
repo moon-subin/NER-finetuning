@@ -17,6 +17,13 @@ VENUE_HEADER = re.compile(r'(?:^|[^\S\r\n]).{0,10}?(?:Venue|VENUE|장소)\s*[:�
 def _fallback_title(text: str) -> Optional[str]:
     for ln in (x.strip() for x in text.splitlines()):
         if not ln or ln.startswith('['): continue
+        # < … 안내 > 같은 표기 정리
+        if re.fullmatch(r'<\s*.+?\s*>', ln):
+            inner = re.sub(r'^[<]\s*|\s*[>]$', '', ln)
+            inner = re.sub(r'\s*안내\s*$', '', inner)
+            inner = _strip_space(inner)
+            if inner:
+                return inner
         # 일정/장소/예매 안내 라인은 제목 후보에서 제외
         if re.match(r'^(일시|장소|티켓|예매\s*오픈)\s*[:：]', ln):
             continue

@@ -38,6 +38,10 @@ def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
     for m in re.finditer(r'(현매|현장)(?:\s*예매)?[^\n]{0,30}?(\d{1,3}(?:,\d{3})+|\d+)\s*(?:원|KRW)?', text):
         onsite.append(_normalize_price(m.group(2)))
 
+    # 2-1) 무료 입장 시 바로 시드
+    if re.search(r'(무료\s*입장|무료입장|무료|free\s*(entrance|admission)?)', text, flags=re.IGNORECASE):
+        price.append("무료")
+
     # 3) PRICE_TYPE 보정: '현장 예매' 합성, '현매' → '현장 예매'
     if re.search(r'현장\s*예매', text):
         ptype.append('현장 예매')
@@ -53,6 +57,10 @@ def _rescan_and_fix_prices(text: str, tokens: List[str], fields: Dict) -> None:
         for x in xs:
             x = _strip_space(x)
             if not x: continue
+            # 무료 케이스 바로 매핑
+            if re.search(r'(무료\s*입장|무료입장|무료|free\s*(entrance|admission)?)', x, flags=re.IGNORECASE):
+                out.append("무료");  # 한글 표준화
+                continue
             # 숫자만 남기기
             m = re.search(r'(\d{1,3}(?:,\d{3})+|\d+)', x)
             if not m: continue

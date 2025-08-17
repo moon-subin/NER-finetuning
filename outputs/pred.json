@@ -1,23 +1,43 @@
 {
-  "TITLE": [],
+  "TITLE": [
+    "문의 : @sungvisor DM"
+  ],
   "DATE": [
-    "2025년 08월 16일",
-    "2025년 8월 16일"
+    "9월 6일",
+    "8월 18일"
   ],
   "TIME": [
-    "7pm",
-    "7시",
-    "6시"
+    "오후 7시",
+    "오후 8시"
   ],
-  "PRICE": [],
-  "PRICE_ONSITE": [],
-  "PRICE_TYPE": [],
-  "LINEUP": [],
-  "INSTAGRAM": [],
+  "PRICE": [
+    "25,000"
+  ],
+  "PRICE_ONSITE": [
+    "28,000"
+  ],
+  "PRICE_TYPE": [
+    "예매",
+    "현장 예매"
+  ],
+  "LINEUP": [
+    "프롬어스",
+    "심각한 개구리",
+    "김늑"
+  ],
+  "INSTAGRAM": [
+    "@band_from.us",
+    "@seriousfrog",
+    "@nknknknknkim"
+  ],
   "VENUE": [
-    "엘리웨이탑하우스"
+    "언플러그드 홍대 B1 공연장"
   ],
   "V_INSTA": [],
-  "TICKET_OPEN_DATE": [],
-  "TICKET_OPEN_TIME": []
+  "TICKET_OPEN_DATE": [
+    "8월 18일 (월)"
+  ],
+  "TICKET_OPEN_TIME": [
+    "오후 8시"
+  ]
 }

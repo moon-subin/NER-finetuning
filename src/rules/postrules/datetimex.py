@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Tuple
 from .patterns import (
     RE_FULLDATE_OPT_YEAR, RE_MD_DOTTED, RE_YMD_DOTTED,
-    RE_EN_TIME, RE_EN_TIME_RANGE, RE_TIME
+    RE_EN_TIME, RE_EN_TIME_RANGE, RE_TIME, RE_EN_DATE
 )
 from .textutils import _strip_space, _dedupe
 
@@ -27,6 +27,18 @@ def _find_dates_with_span(text: str):
     out=[]
     for m in RE_FULLDATE_OPT_YEAR.finditer(text):
         out.append((_join_full_date(m), m.start(), m.end()))
+    # NEW: English dates → "YYYY년 M월 D일" (연도 없으면 "M월 D일")
+    mon_map = {
+        'january':1,'february':2,'march':3,'april':4,'may':5,'june':6,
+        'july':7,'august':8,'september':9,'october':10,'november':11,'december':12,
+        'jan':1,'feb':2,'mar':3,'apr':4,'jun':6,'jul':7,'aug':8,'sep':9,'sept':9,'oct':10,'nov':11,'dec':12
+    }
+    for m in RE_EN_DATE.finditer(text):
+        mm = mon_map.get(m.group('mon').lower())
+        dd = int(m.group('day'))
+        yy = m.group('year')
+        core = f"{mm}월 {dd}일"
+        out.append(f"{yy}년 {core}" if yy else core)
     for m in RE_YMD_DOTTED.finditer(text):
         y, mth, d, dow = m.group('y'), m.group('m'), m.group('d'), m.group('dow')
         core = f"{int(mth)}월 {int(d)}일"
@@ -95,9 +107,10 @@ def _merge_date_with_weekday(dates: list[str]) -> list[str]:
     return merged
 
 def _pick_start_time_only(text: str, times: List[str]) -> List[str]:
-    m = re.search(r'\bSTART\b[^\n]{0,20}?(\d{1,2}(?::\d{2})?)', text, flags=re.IGNORECASE)
+    # START / begin / 공연시작 등에서 첫 시작시각을 우선
+    m = re.search(r'(START|begin|공연\s*시작)[^\n]{0,30}?(\d{1,2}(?::\d{2})?)', text, flags=re.IGNORECASE)
     if m:
-        val = m.group(1)
+        val = m.group(2)
         return [val if ':' in val else f"{int(val)}시"]
     return times
 

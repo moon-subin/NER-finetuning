@@ -26,6 +26,16 @@ RE_TIME = re.compile(
 RE_EN_TIME        = re.compile(r'\b(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>AM|PM|am|pm)\b')
 RE_EN_TIME_RANGE  = re.compile(r'\b(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?-(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\s*(?P<ap>AM|PM|am|pm)\b')
 
+# NEW: Saturday, August 16th, 2025 / August 16, 2025 / Aug 16th 2025
+RE_EN_DATE = re.compile(
+    r'\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*'
+    r'(?P<mon>January|February|March|April|May|June|July|August|September|October|November|December|'
+    r'Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\s+'
+    r'(?P<day>\d{1,2})(?:st|nd|rd|th)?'
+    r'(?:,?\s*(?P<year>\d{4}))?\b',
+    re.IGNORECASE
+)
+
 RE_PRICE   = re.compile(r'(?:(?:₩|￦)\s*)?(?P<amount>\d{1,3}(?:,\d{3})+|\d{4,6}|\d+)\s*(?:원|₩|￦|KRW)?', re.IGNORECASE)
 RE_KR_PRICE= re.compile(r'(?:(?P<man>\d+)\s*만)?\s*(?:(?P<chon>\d+)\s*천)?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+)?\s*(?:원|₩|￦|KRW)?', re.IGNORECASE)
 
@@ -33,7 +43,7 @@ RE_TICKET_OPEN = re.compile(r'(?:티\s*켓\s*(?:은|:)?[^\n]{0,20}?오\s*픈|Tic
 
 TITLE_STOP = {'공지','안내','정보','발표','NOTICE'}
 
-VENUE_KEYWORDS = r'(홀|클럽|라이브|센터|스테이지|스튜디오|씨어터|극장|하우스|라운지|스퀘어|플랫폼|플레이스|페스티벌|레코드|창고|공간|바|펍|플라자|파크|웨이브|베뉴|살롱)'
+VENUE_KEYWORDS = r'(홀|클럽|라이브|센터|스테이지|스튜디오|씨어터|극장|하우스|라운지|스퀘어|플랫폼|플레이스|페스티벌|레코드|창고|공간|바|펍|플라자|파크|웨이브|베뉴|살롱|탑하우스|taphouse|pub|bar)'
 VENUE_BLACKLIST_WORDS = {'도어', '티케팅', '티켓팅', '입장', '현매', '예약', '예매'}
 
 LINEUP_STOPWORDS = {'티켓','오픈','출연','공연','콘서트','쇼케이스','단독','공지','예매','현매','현장','가격'}
