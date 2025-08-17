@@ -1,3 +1,4 @@
+# /rules/postrules/schema.py
 # BIO→fields, thresholds, schema_guard, load_lexicons
 # -*- coding: utf-8 -*-
 import csv

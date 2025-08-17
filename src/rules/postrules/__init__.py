@@ -1,3 +1,4 @@
+# /rules/postrules/__init__.py
 # -*- coding: utf-8 -*-
 from .schema import schema_guard, load_lexicons
 from .public import merge_model_and_rules

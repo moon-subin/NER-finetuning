@@ -1,3 +1,4 @@
+# /rules/postrules/venue.py
 # 공연장 후보 수집/정리
 # -*- coding: utf-8 -*-
 import re
@@ -34,4 +35,13 @@ def _fix_venues(text: str, fields: Dict, lexicons: Optional[Dict]=None) -> None:
         if _is_probable_venue_word(w): venues.append(w)
 
     venues = [_strip_space(v) for v in venues if v and not _is_blacklisted(v)]
+    m = re.search(
+        r'^\s*(?:[•●◦▪️\-\–\—✦❏]\s*)*(?:Venue|VENUE|장소)\s*[:：]\s*([^\n(]+)',
+        text,
+        flags=re.IGNORECASE | re.MULTILINE
+    )   
+    if m:
+        v = _clean_venue_token(m.group(1))
+        if v and not _is_blacklisted(v):
+            venues.append(v)
     fields['VENUE'] = _prefer_longer_unique(_dedupe(venues))

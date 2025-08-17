@@ -1,211 +1,217 @@
-# 라인업/인스타 핸들 수확/정리
+# /rules/postrules/lineup.py
 # -*- coding: utf-8 -*-
 import re
-from typing import Dict, List, Optional, Set, Tuple
-from .patterns import (
-    LINEUP_SEC_HEAD, BULLET_LINE, NAME_CAND, SECTION_BREAK,
-    SECTION_SHOWCASE_HEAD, SECTION_LISTEN_HEAD, SECTION_DJ_HEAD,
-    LINEUP_BLACKLIST_SUBSTR, POSTFIX_JOSA, TITLE_STOP
-)
+from typing import Dict, List, Tuple
 from .textutils import _strip_space, _dedupe
-from .textutils import _prefer_longer_unique  # (혹시 타이틀 정리에서 사용)
-# === 이름/핸들 수확 ===
+
+HANDLE_RE = re.compile(r'^@[A-Za-z0-9._]+$')
+HANDLE_ANYWHERE_RE = re.compile(r'@[A-Za-z0-9._]+')
+TIME_RE   = r'\d{1,2}\s*:\s*\d{2}'
+TIMETABLE_LINE = re.compile(
+    rf'^\s*(?:[•●◦▪️\-\–\—✦❏]\s*)?(?:{TIME_RE})(?:\s*-\s*{TIME_RE})?\s+(.+)$',
+    re.MULTILINE
+)
+NAME_RE = re.compile(
+    r'^\s*(?P<name>(?:DJ\s+)?[A-Za-z][A-Za-z0-9 .\'’\-\&\*/:+_]{1,60}|[가-힣0-9·]+(?:\s[가-힣0-9·]+){0,6})\s*$'
+)
+
+LINEUP_BLACKLIST_SUBSTR = {
+    '오픈','티켓','문의','입장','가격','현매','예매','공지','안내',
+    '라이브홀','클럽','홀','극장','페스티벌','장소','일시','시간표','타임테이블'
+}
 
 def _clean_artist_name(s: str) -> str:
     s = _strip_space(s)
-    s = re.sub(r'^[\-\–—·\•\▶\✅\[\(]+', '', s)
+    s = re.sub(r'^\d{1,2}\s*:\s*\d{2}(?:\s*-\s*\d{1,2}\s*:\s*\d{2})?\s*', '', s)
+    s = re.sub(r'^(with|With)\b', '', s).strip()
     s = re.sub(r'[@\(].*$', '', s)
-    s = re.sub(r'[\*\_`]+', '', s)
-    s = POSTFIX_JOSA.sub('', s)
+    s = re.sub(r'\s*\*\s*', '*', s)          # FRK * LOOP -> FRK*LOOP
+    s = re.sub(r'\s*’\s*', '’', s)           # Hangman ’ s -> Hangman’s
+    s = re.sub(r'\s*\'\s*', "'", s)
+    s = re.sub(r'^[\-\–—•●◦▪️_:\|]+', '', s) # 불릿/밑줄/콜론 제거
+    s = re.sub(r'[`_]+', '', s)
     return _strip_space(s)
 
 def _looks_like_artist(s: str) -> bool:
     if not s or len(s) <= 1: return False
     if any(bad in s for bad in LINEUP_BLACKLIST_SUBSTR): return False
     if re.search(r'\d{1,2}\s*월|\d{1,2}\s*:\s*\d{2}|원\b', s): return False
+    # 전부 대문자(3단어 이상)는 제목/슬로건일 확률↑ → DJ 접두만 예외
+    if not s.lower().startswith('dj '):
+        words = [w for w in re.split(r'\s+', s) if w]
+        if len(words) >= 3 and all(w.isupper() for w in words if re.search(r'[A-Za-z]', w)):
+            return False
     if s.count(' ') >= 8 and not s.lower().startswith('dj '): return False
     return True
 
-def _harvest_names_from_lines(lines: list) -> list:
-    out = []
-    for ln in lines:
-        ln = _strip_space(ln)
+def _extract_timeblock_pairs(text: str) -> List[Tuple[str, str]]:
+    lines = [l for l in (x.rstrip() for x in text.splitlines())]
+    pairs: List[Tuple[str, str]] = []
+    i = 0
+    while i < len(lines):
+        m = TIMETABLE_LINE.match(lines[i].strip())
+        if not m:
+            i += 1; continue
+        name = _clean_artist_name(m.group(1))
+        handle = None
+        j = i + 1; hops = 0
+        while j < len(lines) and hops < 12:
+            ln = lines[j].strip()
+            if TIMETABLE_LINE.match(ln): break
+            if HANDLE_RE.fullmatch(ln): handle = ln; break
+            j += 1; hops += 1
+        if _looks_like_artist(name):
+            pairs.append((name, handle if handle else None))
+        i += 1
+    # dedupe
+    seen, out = set(), []
+    for n, h in pairs:
+        key = (n.lower(), (h or '').lower())
+        if key in seen: continue
+        seen.add(key); out.append((n, h))
+    return out
+
+def _pairs_from_same_line(text: str) -> List[Tuple[str, str]]:
+    """한 줄에 이름과 핸들이 같이 있을 때: 핸들 앞 왼쪽 텍스트를 이름 후보로"""
+    pairs: List[Tuple[str, str]] = []
+    for ln in text.splitlines():
+        ln = ln.strip()
         if not ln: continue
-        m = NAME_CAND.match(ln)
-        if not m: continue
-        name = _clean_artist_name(m.group('name'))
-        if _looks_like_artist(name): out.append(name)
+        for m in HANDLE_ANYWHERE_RE.finditer(ln):
+            left = _clean_artist_name(ln[:m.start()])
+            left = re.sub(r'[-–—·•:|]\s*$', '', left).strip()
+            if _looks_like_artist(left):
+                pairs.append((left, m.group(0)))
+    # dedupe
+    seen, out = set(), []
+    for n, h in pairs:
+        key = (n.lower(), (h or '').lower())
+        if key in seen: continue
+        seen.add(key); out.append((n, h))
     return out
 
-def _collect_lines_in_lineup_sections(text: str) -> list:
-    lines = text.splitlines(); take = False
-    buf, collected = [], []
-    for ln in lines:
-        if LINEUP_SEC_HEAD.search(ln):
-            if buf: collected.extend(buf); buf=[]
-            take = True; continue
-        if take:
-            if SECTION_BREAK.search(ln):
-                take = False
-                if buf: collected.extend(buf); buf=[]
-                continue
-            buf.append(ln)
-    if buf: collected.extend(buf)
-    return collected
-
-def _collect_bullet_lines(text: str) -> list:
-    return [m.group(1) for m in BULLET_LINE.finditer(text)]
-
-def _collect_lines_in_named_section(text: str, head_re: re.Pattern) -> list:
-    lines = text.splitlines(); take = False
-    buf, out = [], []
-    for ln in lines:
-        if head_re.search(ln):
-            if buf: out.extend(buf); buf=[]
-            take = True; continue
-        if take:
-            if (SECTION_BREAK.search(ln) or
-                LINEUP_SEC_HEAD.search(ln) or
-                SECTION_SHOWCASE_HEAD.search(ln) or
-                SECTION_LISTEN_HEAD.search(ln) or
-                SECTION_DJ_HEAD.search(ln)):
-                take = False
-                if buf: out.extend(buf); buf=[]
-                continue
-            buf.append(ln)
-    if buf: out.extend(buf)
+# NEW: with 블록 전용 파서
+WITH_HEAD = re.compile(r'^\s*with\s*$', re.IGNORECASE)
+NEXT_SECTION = re.compile(r'^\s*\[.*?\]\s*$')
+def _pairs_from_with_block(text: str) -> List[Tuple[str, str]]:
+    lines = [l.rstrip() for l in text.splitlines()]
+    pairs: List[Tuple[str, str]] = []
+    for i, ln in enumerate(lines):
+        if not WITH_HEAD.match(ln): continue
+        j = i + 1
+        while j < len(lines):
+            r = lines[j].strip()
+            if r == "":
+                j += 1; continue
+            if NEXT_SECTION.match(r) or re.search(r'(공연\s*정보|일시|장소|티켓)', r):
+                break
+            m = HANDLE_ANYWHERE_RE.search(r)
+            if m:
+                name = _clean_artist_name(r[:m.start()])
+                handle = m.group(0)
+                if _looks_like_artist(name):
+                    pairs.append((name, handle))
+            j += 1
+    # dedupe
+    seen, out = set(), []
+    for n, h in pairs:
+        key = (n.lower(), h.lower())
+        if key in seen: continue
+        seen.add(key); out.append((n, h))
     return out
 
-def _extract_lineup_and_handles_linewise_from(blocks: List[str]) -> List[tuple]:
-    pairs=[]; pat=re.compile(r'^(?P<name>[^@#\|\[\]\(\)]+)\s+(@[A-Za-z0-9._]+)\s*$')
-    for block in blocks:
-        for ln in block.splitlines():
-            ln = _strip_space(ln)
-            if not ln: continue
-            m = pat.match(ln)
-            if not m: continue
-            name = _clean_artist_name(m.group('name'))
-            handle = m.group(2)
-            if _looks_like_artist(name): pairs.append((name, handle))
-    return pairs
+def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    pairs += _pairs_from_with_block(text)
+    pairs += _pairs_from_same_line(text)
+    # 다음 줄 패턴: NAME ↵ @handle
+    lines = [l for l in (x.strip() for x in text.splitlines()) if l != ""]
+    for i in range(len(lines) - 1):
+        if lines[i].startswith('@'): continue
+        if HANDLE_RE.fullmatch(lines[i+1]):
+            name = _clean_artist_name(lines[i])
+            if _looks_like_artist(name):
+                pairs.append((name, lines[i+1]))
+    # 타임테이블
+    pairs += _extract_timeblock_pairs(text)
+    # dedupe
+    seen, out = set(), []
+    for n, h in pairs:
+        key = (n.lower(), (h or '').lower())
+        if key in seen: continue
+        seen.add(key); out.append((n, h if h else None))
+    return out
 
-def _pair_name_then_handle(text: str, blocks: List[str]) -> List[tuple]:
-    pairs=[]; name_pat=re.compile(r'^(?P<name>[^@#\|\[\]\(\)]+?)\s*$'); handle_pat=re.compile(r'^(@[A-Za-z0-9._]+)\s*$')
-    for block in blocks:
-        lines=[_strip_space(x) for x in block.splitlines()]
-        for i, ln in enumerate(lines[:-1]):
-            m1=name_pat.match(ln); m2=handle_pat.match(lines[i+1])
-            if not (m1 and m2): continue
-            name=_clean_artist_name(m1.group('name')); handle=m2.group(1)
-            if _looks_like_artist(name): pairs.append((name, handle))
-    return pairs
+def harvest_lineup_names(text: str) -> List[str]:
+    """
+    보수적으로: with ~ [공연 정보] 구간 + 타임테이블에서만 라인업 수확
+    """
+    names: List[str] = []
+    # 타임테이블 먼저
+    for m in TIMETABLE_LINE.finditer(text):
+        nm = _clean_artist_name(m.group(1))
+        if _looks_like_artist(nm): names.append(nm)
+    # with 블록 추출
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    collecting = False
+    for ln in lines:
+        raw = ln.strip()
+        if re.fullmatch(r'with', raw, flags=re.IGNORECASE):
+            collecting = True
+            continue
+        if collecting:
+            if not raw:
+                continue
+            if re.fullmatch(r'\[.*?\]', raw) or re.search(r'(공연\s*정보|일시|장소|티켓)', raw):
+                break
+            if HANDLE_ANYWHERE_RE.search(raw):
+                raw = re.sub(HANDLE_ANYWHERE_RE, '', raw)
+            cand = _clean_artist_name(raw)
+            if _looks_like_artist(cand):
+                names.append(cand)
+    return _dedupe(names)
 
-def _filter_instagram_handles(text: str, fields: Dict, pairs: List[tuple]) -> None:
-    if pairs:
-        keep = {h for _, h in pairs}
-        fields['INSTAGRAM'] = [h for h in fields.get('INSTAGRAM', []) if h in keep]
-        return
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    header = "\n".join(lines[:2])
-    header_handles = set(re.findall(r'@[A-Za-z0-9._]+', header))
-    fields['INSTAGRAM'] = [h for h in fields.get('INSTAGRAM', []) if h not in header_handles]
+def collect_all_handles(text: str) -> List[str]:
+    return _dedupe(HANDLE_ANYWHERE_RE.findall(text))
 
-def _dj_block_names(text_norm: str) -> set:
-    dj_lines = _collect_lines_in_named_section(text_norm, SECTION_DJ_HEAD)
-    names = set(_harvest_names_from_lines(dj_lines))
-    bullet_dj = _collect_bullet_lines("\n".join(dj_lines))
-    names |= set(_harvest_names_from_lines(bullet_dj))
-    return names
-
-def _tidy_title(fields: Dict) -> None:
-    xs=[]
+def tidy_title(fields: Dict) -> None:
+    xs = []
     for t in fields.get('TITLE', []) or []:
-        t=_strip_space(t)
+        t = _strip_space(t)
         if not t: continue
-        if t in TITLE_STOP: continue
+        if t in {'달','공지','안내','정보','발표','NOTICE'}: continue
         if len(t) <= 1: continue
         xs.append(t)
     fields['TITLE'] = _dedupe(xs)
 
-def _fix_instagram(fields: Dict) -> None:
-    inst=list(fields.get('INSTAGRAM', []) or [])
-    for x in fields.get('LINEUP', []):
-        if x.startswith('@'): inst.append(x)
+def fix_instagram(fields: Dict) -> None:
+    inst = list(fields.get('INSTAGRAM', []) or [])
+    for x in fields.get('LINEUP', []) or []:
+        if x and x.startswith('@') and x not in inst:
+            inst.append(x)
     fields['INSTAGRAM'] = _dedupe(inst)
 
-def _cut_named_sections(text: str, head_res: list[re.Pattern]) -> str:
-    """특정 섹션(예: DJ) 본문을 text에서 제거해 안전 블록을 만든다."""
-    lines = text.splitlines()
-    out, take, buf = [], True, []
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        # 섹션 헤더 시작?
-        if any(hr.search(ln) for hr in head_res):
-            # 해당 섹션 끝(SECTION_BREAK 또는 다음 섹션 헤더류)까지 스킵
-            i += 1
-            while i < len(lines):
-                ln2 = lines[i]
-                if (SECTION_BREAK.search(ln2) or
-                    LINEUP_SEC_HEAD.search(ln2) or
-                    SECTION_SHOWCASE_HEAD.search(ln2) or
-                    SECTION_LISTEN_HEAD.search(ln2) or
-                    SECTION_DJ_HEAD.search(ln2)):
-                    break
-                i += 1
-            # 현재 i는 섹션 경계(또는 종료) 지점
-            continue
-        out.append(ln)
-        i += 1
-    return "\n".join(out)
+_tidy_title = tidy_title
+_fix_instagram = fix_instagram
+# 새로 추가: 공연장/주최 측 핸들을 분리(장소/프로필 링크 주변에 나타난 핸들은 V_INSTA로 분류)
+def _filter_instagram_handles(text: str, handles: list[str]) -> tuple[list[str], list[str]]:
+    lines = [ln.rstrip() for ln in (text or "").splitlines()]
+    venue_zone: set[str] = set()
 
-def _pairs_from_anywhere(text: str) -> list[tuple]:
-    """
-    DJ 섹션을 제외한 전체 텍스트에서
-    1) '이름 @handle' 한 줄 패턴
-    2) '이름' ↵ '@handle' 두 줄 패턴
-    을 모두 수확.
-    """
-    safe = _cut_named_sections(text, [SECTION_DJ_HEAD])
-    blocks = [safe]
-    pairs1 = _extract_lineup_and_handles_linewise_from(blocks)
-    pairs2 = _pair_name_then_handle(safe, blocks)
-    return _dedupe(pairs1 + pairs2)
+    # (1) "장소:" / "Venue:" 라인 및 다음 2줄까지 스캔
+    for i, ln in enumerate(lines):
+        if re.search(r'(?:^|\s)(Venue|VENUE|장소)\s*[:：]', ln, flags=re.IGNORECASE):
+            venue_zone.update(HANDLE_ANYWHERE_RE.findall(ln))
+            for j in (i+1, i+2):
+                if 0 <= j < len(lines):
+                    venue_zone.update(HANDLE_ANYWHERE_RE.findall(lines[j]))
 
-def _extract_name_handle_runs(text: str) -> list[tuple]:
-    """
-    전역 텍스트에서 '이름' 다음 줄이 '@handle'인 패턴을 쭉 긁어옵니다.
-    - 공백 줄은 건너뜀
-    - DJ 섹션은 무시 (오탐 방지)
-    """
-    # DJ 섹션 제거(대충이라도 잘라내면 오탐 크게 줄어듭니다)
-    lines = text.splitlines()
-    cleaned = []
-    skip = False
+    # (2) "프로필 링크 참조" 같은 안내 라인에 나온 핸들도 장소 측으로 간주
     for ln in lines:
-        if SECTION_DJ_HEAD.search(ln):
-            skip = True
-            continue
-        if skip:
-            # 다음 섹션 헤더/구분선 나오기 전까지 스킵
-            if re.match(r'^\s*(\[.*?\]|[-=]{3,}|공연\s*정보|일시|장소|티켓|입장|문의|PRICE|TIME|DATE)\s*[:|]?', ln):
-                skip = False
-            continue
-        cleaned.append(ln)
+        if re.search(r'(프로필\s*링크|링크\s*참조)', ln):
+            venue_zone.update(HANDLE_ANYWHERE_RE.findall(ln))
 
-    lines = [l for l in (x.strip() for x in cleaned) if l != ""]
-    pairs = []
-    handle_pat = re.compile(r'^@[A-Za-z0-9._]+$')
-    for i in range(len(lines) - 1):
-        name = lines[i]
-        nxt  = lines[i+1]
-        if name.startswith('@'):
-            continue
-        if handle_pat.match(nxt):
-            # 간단 정리: 괄호/핸들 제거, 양끝 공백 정리
-            name_clean = re.sub(r'[@\(].*$', '', name).strip()
-            # 너무 짧으면 제외
-            if len(name_clean) <= 1: 
-                continue
-            pairs.append((name_clean, nxt))
-    return _dedupe(pairs)
+    venue_zone = {h for h in venue_zone if h in handles}
+    artist_handles = [h for h in handles if h not in venue_zone]
+    venue_handles  = list(venue_zone)
+    return artist_handles, venue_handles

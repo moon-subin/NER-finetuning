@@ -6,13 +6,15 @@
 
 예)
 python scripts/predict_text.py `
---model_dir outputs/models/koelectra_crf `
---text_file input.txt `
---thresholds outputs/thresholds.json `
---artists_csv data/lexicon/artists.csv `
---venues_csv data/lexicon/venues.csv `
---rules on `
---out outputs/pred.json
+>> --model_dir outputs/models/koelectra_crf `
+>> --text_file input.txt `
+>> --thresholds outputs/thresholds.json `
+>> --artists_csv data/lexicon/artists.csv `
+>> --venues_csv data/lexicon/venues.csv `
+>> --rules on `
+>> --out outputs/pred.json `
+>> --quiet `
+>> --strip_internal
 """
 
 import os, sys, io, re, json, argparse
@@ -22,12 +24,19 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-import torch
+import torch, warnings
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, logging as hf_logging
 
 from src.models.koelectra_crf import ElectraCRF
 from src.rules.postrules import merge_model_and_rules, schema_guard, load_lexicons
+
+def _silence_lib_logs():
+    # 라이브러리 경고/로그 최소화
+    warnings.filterwarnings("ignore")
+    hf_logging.set_verbosity_error()
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 간이 토크나이저 (공연 공지 특화)
@@ -63,23 +72,30 @@ def simple_tokenize(text: str):
     while i < len(toks):
         t = toks[i]
 
-        # 앞에 통화기호가 오고 뒤에 숫자면 결합: '₩' '25,000' -> '25,000원'
+        # 앞에 통화기호가 오고 뒤에 숫자면 결합: '₩' '35,000' -> '35,000'
         if t in ('₩','￦') and i + 1 < len(toks) and re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)", toks[i+1]):
-            merged.append(toks[i+1] + "원")
+            merged.append(toks[i+1])
             i += 2
             continue
 
-        # '25,000' + ('원'|'won'|'KRW') -> '25,000원'
+        # '35,000' + ('원'|'won'|'KRW') -> '35,000'
         if i + 1 < len(toks) and toks[i+1].upper() in ("원".upper(), "WON", "KRW"):
             if re.fullmatch(r"(?:\d{1,3}(?:,\d{3})+|\d+)", t):
-                merged.append(t + "원")
+                merged.append(t)
                 i += 2
                 continue
 
-        # '3' '만' '5' '천원' -> '3만5천원'  (천원/원 모두 커버)
+        # 'krw' + '35000' -> '30,000'
+        if t.upper() in ("WON", "KRW") and i + 1 < len(toks) and re.fullmatch(r"\d+", toks[i+1]):
+            merged.append(f"{int(toks[i+1]):,}")
+            i += 2
+            continue 
+
+        # '3' '만' '5' '천원' -> '35,000' 로 표준화
         if i + 3 < len(toks) and toks[i+1] == "만" and re.fullmatch(r"\d+", toks[i]) and re.fullmatch(r"\d+", toks[i+2]):
             if toks[i+3].endswith("원"):
-                merged.append(f"{toks[i]}만{toks[i+2]}천원")
+                val = int(toks[i]) * 10000 + int(toks[i+2]) * 1000
+                merged.append(f"{val:,}")
                 i += 4
                 continue
 
@@ -225,7 +241,18 @@ def main():
     ap.add_argument("--rules", choices=["on", "off"], default="on",
                     help="정규표현식/사전 후처리 사용 여부 (default: on)")
     ap.add_argument("--out", default=None, help="최종 JSON 결과를 파일로 저장")
+    ap.add_argument("--quiet", action="store_true",
+                help="최종 JSON만 stdout에 출력(나머지 로그/프린트 숨김)")
+    ap.add_argument("--no_tokens", action="store_true",
+                help="TOKENS/MODEL PRED 섹션 출력 안 함")
+    ap.add_argument("--no_text", action="store_true",
+                    help="INPUT TEXT 미리보기 출력 안 함")
+    ap.add_argument("--strip_internal", action="store_true",
+                    help="최종 JSON에서 tokens/text 키 제거")
+
     args = ap.parse_args()
+    if args.quiet:
+        _silence_lib_logs()
 
     # 입력 텍스트 로드
     if not os.path.exists(args.text_file):
@@ -313,7 +340,13 @@ def main():
 
     if args.rules == "on":
         lex = load_lexicons(args.artists_csv, args.venues_csv)
-        merged = merge_model_and_rules(tokens, pred_labels, conf_token, thresholds, lexicons=lex)
+        # 원본 텍스트(raw_text)를 규칙 엔진에 전달하여 멀티라인 정규식이 정확히 동작하도록 함
+        merged = merge_model_and_rules(
+            tokens, pred_labels,
+            conf_token, thresholds,
+            lexicons=lex,
+            raw_text=raw_text
+        )
         clean  = schema_guard(merged)
     else:
         # thresholds만 적용하고 BIO 그대로 출력
@@ -335,20 +368,30 @@ def main():
         fields["text"] = " ".join(tokens)
         clean = schema_guard(fields)
 
-    # 출력
-    print("\n=== INPUT FILE ===")
-    print(args.text_file)
-    print("\n=== INPUT TEXT (first 300 chars) ===")
-    preview = raw_text[:300].replace("\n", " ")
-    print(preview + ("..." if len(raw_text) > 300 else ""))
-    print("\n=== TOKENS ===")
-    print(tokens)
-    print("\n=== MODEL PRED (token-level) ===")
-    print(list(zip(tokens, pred_labels, [round(c,3) for c in conf_token])))
+    # ---- 출력 ----
+    # (최종 JSON 만들기 전에 내부 키 제거 옵션 적용)
+    if args.strip_internal:
+        clean.pop("tokens", None)
+        clean.pop("text", None)
 
-    print("\n=== FINAL FIELDS (after thresholds {} rules) ===".format("+" if args.rules=="on" else "without"))
     result_str = json.dumps(clean, ensure_ascii=False, indent=2)
-    print(result_str)
+
+    if args.quiet:
+        # 최종 JSON만 출력
+        print(result_str)
+    else:
+        # (기존 디버그/미리보기 등 상세 출력)
+        # print("\n=== INPUT FILE ===")
+        # print(args.text_file)
+        # print("\n=== INPUT TEXT (first 300 chars) ===")
+        # preview = raw_text[:300].replace("\n", " ")
+        # print(preview + ("..." if len(raw_text) > 300 else ""))
+        # print("\n=== TOKENS ===")
+        # print(tokens)
+        # print("\n=== MODEL PRED (token-level) ===")
+        # print(list(zip(tokens, pred_labels, [round(c,3) for c in conf_token])))
+        # print("\n=== FINAL FIELDS (after thresholds {} rules) ===".format("+" if args.rules=="on" else "without"))
+        print(result_str)
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
