@@ -14,25 +14,72 @@ from .venue import _fix_venues
 
 VENUE_HEADER = re.compile(r'(?:^|[^\S\r\n]).{0,10}?(?:Venue|VENUE|장소)\s*[:：]\s*(.+)$', re.IGNORECASE | re.MULTILINE)
 
-def _fallback_title(text: str) -> Optional[str]:
-    for ln in (x.strip() for x in text.splitlines()):
-        if not ln or ln.startswith('['): continue
-        # < … 안내 > 같은 표기 정리
-        if re.fullmatch(r'<\s*.+?\s*>', ln):
-            inner = re.sub(r'^[<]\s*|\s*[>]$', '', ln)
-            inner = re.sub(r'\s*안내\s*$', '', inner)
-            inner = _strip_space(inner)
-            if inner:
-                return inner
-        # 일정/장소/예매 안내 라인은 제목 후보에서 제외
-        if re.match(r'^(일시|장소|티켓|예매\s*오픈)\s*[:：]', ln):
+# ── NEW: 해시태그 배제 & 점수 기반TITLE 선택기 ───────────────────────────
+_TITLE_NOTICE = re.compile(r'(NOTICE|공지|안내|현장\s*안내)', re.IGNORECASE)
+_TITLE_BAD    = re.compile(r'(공연\s*시간|공연시간)', re.IGNORECASE)
+_TITLE_HINT   = re.compile(r'(단독\s*콘서트|콘서트|공연|쇼케이스|LIVE)', re.IGNORECASE)
+# “날짜만” 같은 라인 배제(짧은 길이의 날짜/요일/숫자/구분자 조합)
+_DATEISH = re.compile(
+    r'^[\s0-9./()\-\u00B7]*(?:년|월|일|Mon|Tue|Wed|Thu|Fri|Sat|Sun|January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[\s0-9./()\-\u00B7,]*$',
+    re.IGNORECASE
+)
+
+def _pick_best_title_from_text(text: str) -> str | None:
+    """
+    규칙:
+      - 해시태그(#…) 라인: 절대 제외
+      - '공지/안내' 라인: 완전 제외 X, 다만 후순위(점수↓)
+      - 날짜만 같은 라인(짧고 날짜표현 위주): 제외
+      - 괄호형(<…>, 【…】 등): 가산점
+      - '공연/콘서트/쇼케이스/LIVE' 키워드 포함: 가산점
+      - ':' 포함: 가산점
+      - 길이 6–60자: 가산점
+      - 최고 점수(동점이면 더 긴 것) 채택
+    """
+    best, best_score = None, -10
+    for raw in (ln.strip() for ln in (text or '').splitlines()):
+        if not raw:
             continue
-        ln = ln.lstrip('_-•●◦❏').strip()
-        if ':' in ln and re.search(r'[A-Za-z가-힣]', ln):
-            left, right = ln.split(':', 1)
-            if _strip_space(left) and _strip_space(right):
-                return _strip_space(left + ' : ' + right)
-    return None
+        # 꾸밈 글자/기호 정규화 (NFKC + 불릿 치환)
+        raw = _to_ascii_compat(raw)
+        if raw.startswith('#'):
+            continue  # 해시태그는 절대 TITLE 후보 아님
+        # 좌측 장식/이모지/불릿 제거
+        ln = re.sub(r'^[\s📢🗓️🕰️⏱️🎪🎫💵👨🏻‍⚖️👨🏻‍💻\-\–—•●◦▪️_:\|·]+', '', raw)
+        ln = re.sub(r'^\-\s*', '', ln)  # "- title" 형태도 정리
+        if not ln:
+            continue
+        # 짧은 날짜 전용 라인은 배제(태그성/날짜성 제목 방지)
+        if len(ln) <= 30 and _DATEISH.fullmatch(ln or ""):
+            continue
+        score = 0
+        # 괄호/브라켓형 제목(공지어도 후보로 남김, 단 점수↓)
+        m = re.match(r'^[\[\(<【]\s*(.+?)\s*[】>\)\]]$', ln)
+        if m:
+            ln = _strip_space(m.group(1))
+            score += 2
+        # 힌트 키워드
+        if _TITLE_HINT.search(ln):
+            score += 3
+        # 콜론 포함(부제/형식 제목)
+        if ':' in ln or '：' in ln:
+            score += 1
+        # 적당 길이
+        if 6 <= len(ln) <= 60:
+            score += 1
+        # 공지/안내는 후순위(감점)
+        if _TITLE_NOTICE.search(ln):
+            score -= 2
+        # '공연시간' 같은 안내성 라인은 강한 감점
+        if _TITLE_BAD.search(ln):
+            score -= 4
+        if score > best_score or (score == best_score and best and len(ln) > len(best)):
+            best, best_score = ln, score
+    return best if best_score > -10 else None
+
+def _fallback_title(text: str) -> Optional[str]:
+    # 새 점수 기반 선택기로 대체
+    return _pick_best_title_from_text(text)
 
 def _extract_venue_header(text: str) -> Optional[str]:
     m = VENUE_HEADER.search(text)
@@ -69,6 +116,17 @@ def apply_regex_postrules(text: str, tokens: List[str], fields: Dict[str, List[s
     _normalize_dates(tokens, t, fields)
     _normalize_times(t, fields)
     fields['TIME'] = _pick_start_time_only(t, fields.get('TIME', []))
+    # '입장/door open' 주변에서 나온 시간들은 버림
+    if fields.get('TIME'):
+        kept=[]
+        for tm in fields['TIME']:
+            if not tm: continue
+            # 시간 문자열 주변 0~15자 범위에 '입장|door open'이 있으면 제외
+            pat = re.compile(rf'(입장|door\s*open)[^\n]{{0,15}}{re.escape(tm)}|{re.escape(tm)}[^\n]{{0,15}}(입장|door\s*open)', re.IGNORECASE)
+            if pat.search(t): 
+                continue
+            kept.append(tm)
+        fields['TIME'] = kept or fields['TIME']
     _ticket_open_mapping(t, fields)
     _rescan_and_fix_prices(t, tokens, fields)
 
@@ -86,10 +144,17 @@ def apply_regex_postrules(text: str, tokens: List[str], fields: Dict[str, List[s
         if (not cur) or (len(long_v) > max(len(x) for x in cur)):
             fields['VENUE'] = [long_v]
 
-    # 5) TITLE 보정: ':'로 시작하거나 2자 이하인 기존 타이틀은 폴백으로 교체
-    if (not fields.get('TITLE')) or any(_strip_space(x).startswith(':') or len(_strip_space(x)) <= 2 for x in fields['TITLE']):
-        tt = _fallback_title(text)
-        if tt: fields['TITLE'] = [tt]
+    # 5) TITLE 보정: 폴백 후보가 있으면 기존 공지/해시태그/짧은 타이틀을 교체
+    tt = _fallback_title(text)
+    if tt:
+        cur = [ _strip_space(x) for x in (fields.get('TITLE', []) or []) ]
+        def _looks_bad_title(x: str) -> bool:
+            if not x or len(x) <= 2: return True
+            if x.startswith('#'): return True
+            if _TITLE_NOTICE.search(x): return True
+            return False
+        if (not cur) or any(_looks_bad_title(x) for x in cur) or (len(tt) > max(len(x) for x in cur)):
+            fields['TITLE'] = [tt]
     _tidy_title(fields)
 
     # 6) 마무리

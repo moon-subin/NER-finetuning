@@ -14,6 +14,7 @@ TIMETABLE_LINE = re.compile(
 NAME_RE = re.compile(
     r'^\s*(?P<name>(?:DJ\s+)?[A-Za-z][A-Za-z0-9 .\'’\-\&\*/:+_]{1,60}|[가-힣0-9·]+(?:\s[가-힣0-9·]+){0,6})\s*$'
 )
+HASH_NAME_LINE = re.compile(r'^\s*#\s*(?P<tag>[A-Za-z0-9._\-]+|[가-힣0-9·]+)\s*$', re.UNICODE)
 BI_NAME_LINE = re.compile(  # "English / 한글" 혹은 "English/한글"
     r'^\s*(?P<en>[A-Za-z0-9 .\'’\-&:_]{2,60})\s*/\s*[가-힣0-9 .\'’\-&:_]{1,60}\s*$'
 )
@@ -22,8 +23,20 @@ BI_NAME_RE = re.compile(  # NEW: "English / 한글" or "English/한글"
 )
 LINEUP_BLACKLIST_SUBSTR = {
     '오픈','티켓','문의','입장','가격','현매','예매','공지','안내',
+    '주최','주관','기획',
     '라이브홀','클럽','홀','극장','페스티벌','장소','일시','시간표','타임테이블'
 }
+BAD_GENERIC_HASHTAGS = {
+    '공연','자선공연','정기','안내','정보','라이브','채널','구독','라이브앤라우드',
+    '이벤트','예약','예매','현매','입장','무료','티켓'
+}
+
+# NEW: "출연: ..." / "라인업: ..." / "게스트: ..." 전역 패턴
+#  - 라인 앞에 불릿(✅▪️•●◦-–—▶· 등)이 와도 허용
+CAST_LINE = re.compile(
+    r'^\s*(?:[✅▪️•●◦\-–—▶·]\s*)*(?:출연|라인업|게스트)\s*[:：]\s*(.+)$',
+    re.IGNORECASE | re.MULTILINE
+)
 
 def _clean_artist_name(s: str) -> str:
     s = _strip_space(s)
@@ -33,7 +46,7 @@ def _clean_artist_name(s: str) -> str:
     s = re.sub(r'\s*\*\s*', '*', s)          # FRK * LOOP -> FRK*LOOP
     s = re.sub(r'\s*’\s*', '’', s)           # Hangman ’ s -> Hangman’s
     s = re.sub(r'\s*\'\s*', "'", s)
-    s = re.sub(r'^[\-\–—•●◦▪️_:\|]+', '', s) # 불릿/밑줄/콜론 제거
+    s = re.sub(r'^[\-\–—•●◦▪️_:\|·]+', '', s) # 불릿/밑줄/콜론/중점 제거
     s = re.sub(r'[`_]+', '', s)
     return _strip_space(s)
 
@@ -48,6 +61,46 @@ def _looks_like_artist(s: str) -> bool:
             return False
     if s.count(' ') >= 8 and not s.lower().startswith('dj '): return False
     return True
+
+def _names_from_hashtag_runs(text: str) -> List[str]:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    out: List[str] = []
+    run: List[str] = []
+
+    def _flush(start_idx: int):
+        nonlocal out, run
+        if len(run) >= 3:
+            # 1) 문서 끝 20% 안에 있는 해시태그 블록이면 무시
+            if start_idx > int(len(lines) * 0.8):
+                run = []
+                return
+            # 2) BAD_GENERIC_HASHTAGS가 대부분이면 무시
+            bad_count = sum(1 for t in run if t in BAD_GENERIC_HASHTAGS)
+            if bad_count >= len(run) * 0.6:  # 60% 이상이 generic 태그
+                run = []
+                return
+            # 3) 정상 라인업 블록 처리
+            for tag in run:
+                tag = tag.replace('_', ' ')
+                tag = _strip_space(tag)
+                if not tag or tag in BAD_GENERIC_HASHTAGS:
+                    continue
+                if _looks_like_artist(tag):
+                    out.append(tag)
+        run = []
+
+    for i, ln in enumerate(lines):
+        m = HASH_NAME_LINE.match(ln)
+        if m:
+            run.append(m.group('tag'))
+            run_start = i if len(run) == 1 else run_start
+        else:
+            if run:
+                _flush(run_start)
+    if run:
+        _flush(run_start)
+    return _dedupe(out)
+
 
 def _extract_timeblock_pairs(text: str) -> List[Tuple[str, str]]:
     lines = [l for l in (x.rstrip() for x in text.splitlines())]
@@ -129,6 +182,25 @@ def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     pairs += _pairs_from_with_block(text)
     pairs += _pairs_from_same_line(text)
+
+    # NEW: 해시태그 블록(#이름 … #이름) → (이름, None) 쌍으로 수확
+    for nm in _names_from_hashtag_runs(text):
+        pairs.append((nm, None))
+
+    # NEW: "출연: A with B, C ..." 형태 전역 수확 (핸들 없어도 이름만 라인업으로)
+    for m in CAST_LINE.finditer(text):
+        seg = m.group(1)
+        # with/AND/&/그리고/및 → 구분자로 변환
+        seg = re.sub(r'\bwith\b', ',', seg, flags=re.IGNORECASE)
+        seg = re.sub(r'\b(and|&)\b', ',', seg, flags=re.IGNORECASE)
+        seg = re.sub(r'\b(그리고|및)\b', ',', seg)
+        # 콤마/슬래시/중점(·/U+00B7)/한글중점(·) 구분
+        parts = re.split(r'[,\u00B7/·]+', seg)
+        for p in parts:
+            name = _clean_artist_name(p)
+            if _looks_like_artist(name):
+                pairs.append((name, None))
+
     # NEW: 바이링궐 라인을 전역에서 수확 (핸들 없어도 이름만 라인업으로)
     for ln in (x.strip() for x in text.splitlines()):
         if not ln or ln.startswith('#') or ln.startswith('@'): 
@@ -141,6 +213,7 @@ def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
             name = _clean_artist_name(m.group('en'))
             if _looks_like_artist(name):
                 pairs.append((name, None))
+
     # 다음 줄 패턴: NAME ↵ @handle
     lines = [l for l in (x.strip() for x in text.splitlines()) if l != ""]
     for i in range(len(lines) - 1):
@@ -149,8 +222,10 @@ def extract_pairs_anywhere(text: str) -> List[Tuple[str, str]]:
             name = _clean_artist_name(lines[i])
             if _looks_like_artist(name):
                 pairs.append((name, lines[i+1]))
+
     # 타임테이블
     pairs += _extract_timeblock_pairs(text)
+
     # dedupe
     seen, out = set(), []
     for n, h in pairs:
@@ -169,6 +244,10 @@ def harvest_lineup_names(text: str) -> List[str]:
     for m in TIMETABLE_LINE.finditer(text):
         nm = _clean_artist_name(m.group(1))
         if _looks_like_artist(nm): names.append(nm)
+    # NEW: 해시태그 블록에서도 수확
+    for nm in _names_from_hashtag_runs(text):
+        if _looks_like_artist(nm):
+            names.append(nm)
     # with 블록 추출
     lines = [ln.rstrip() for ln in text.splitlines()]
     collecting = False
@@ -208,6 +287,21 @@ def tidy_title(fields: Dict) -> None:
         if len(t) <= 1: continue
         xs.append(t)
     fields['TITLE'] = _dedupe(xs)
+    # NEW: "… :" 로 끝난 항목과 바로 뒤 항목을 결합 (잘린 제목 복구)
+    if len(xs) >= 2:
+        merged = []
+        i = 0
+        while i < len(xs):
+            cur = xs[i]
+            nxt = xs[i+1] if i+1 < len(xs) else None
+            if nxt and re.search(r'[:：]\s*$', cur):
+                merged.append(_strip_space(f"{cur} {nxt}"))
+                i += 2
+            else:
+                merged.append(cur)
+                i += 1
+        xs = merged
+    fields['TITLE'] = _dedupe(xs)
 
 def fix_instagram(fields: Dict) -> None:
     inst = list(fields.get('INSTAGRAM', []) or [])
@@ -237,6 +331,13 @@ def _filter_instagram_handles(text: str, handles: list[str]) -> tuple[list[str],
             venue_zone.update(HANDLE_ANYWHERE_RE.findall(ln))
 
     venue_zone = {h for h in venue_zone if h in handles}
-    artist_handles = [h for h in handles if h not in venue_zone]
+    # (3) '주최/주관/기획' 라인의 핸들은 통째로 버림
+    drop: set[str] = set()
+    for ln in lines:
+        if re.search(r'(주최|주관|기획)\s*[:：]', ln):
+            drop.update(HANDLE_ANYWHERE_RE.findall(ln))
+
+    venue_zone = {h for h in venue_zone if h in handles and h not in drop}
+    artist_handles = [h for h in handles if h not in venue_zone and h not in drop]
     venue_handles  = list(venue_zone)
     return artist_handles, venue_handles

@@ -107,11 +107,30 @@ def _merge_date_with_weekday(dates: list[str]) -> list[str]:
     return merged
 
 def _pick_start_time_only(text: str, times: List[str]) -> List[str]:
-    # START / begin / 공연시작 등에서 첫 시작시각을 우선
-    m = re.search(r'(START|begin|공연\s*시작)[^\n]{0,30}?(\d{1,2}(?::\d{2})?)', text, flags=re.IGNORECASE)
-    if m:
-        val = m.group(2)
-        return [val if ':' in val else f"{int(val)}시"]
+    """
+    '시간 : 오후 7시' / '시간: 7:00' 등을 최우선으로 뽑되,
+    '공연시간(러닝타임)'은 제외. 숫자 파싱은 항상 정규식으로 안전 처리.
+    """
+    # 1) "시간 : HH(:MM)" (단, '공연시간' 제외)
+    m1 = re.search(r'(?<!공연)\b시간\s*[:：]\s*([^\n]{1,15})', text)
+    if m1:
+        raw = re.sub(r'\s+', ' ', (m1.group(1) or '')).strip()
+        ampm = '오전' if '오전' in raw else ('오후' if '오후' in raw else '')
+        hm = re.search(r'(\d{1,2})(?::\s*(\d{2}))?', raw)
+        if hm:
+            h = int(hm.group(1))
+            mm = hm.group(2)
+            if mm:
+                out = f"{ampm + ' ' if ampm else ''}{h}:{mm}"
+            else:
+                out = f"{ampm + ' ' if ampm else ''}{h}시"
+            return [out]
+    # 2) "START/begin/공연 시작 HH(:MM)"
+    m2 = re.search(r'(START|begin|공연\s*시작)[^\n]{0,30}?(\d{1,2})(?::(\d{2}))?', text, flags=re.IGNORECASE)
+    if m2:
+        h = int(m2.group(2))
+        mm = m2.group(3)
+        return [f"{h}:{mm}" if mm else f"{h}시"]
     return times
 
 def _normalize_dates(tokens: List[str], text: str, fields: Dict) -> None:
@@ -125,4 +144,16 @@ def _normalize_times(text: str, fields: Dict) -> None:
         times.append(_normalize_time(m.group(0)))
     for m in RE_EN_TIME.finditer(text): times.append(f"{int(m.group('h'))}시")
     for m in RE_EN_TIME_RANGE.finditer(text): times.append(f"{int(m.group('h1'))}시")
-    fields['TIME'] = _dedupe([_strip_space(t) for t in times])
+    # 30분/러닝타임 같은 잡음 제거 + 24시 초과 방지
+    cleaned = []
+    for t in times:
+        t = _strip_space(t)
+        if not t: continue
+        if re.search(r'분\b', t):    # "30분", "90분" 등은 제외
+            continue
+        if re.fullmatch(r'(\d{1,2})시', t):
+            h = int(re.fullmatch(r'(\d{1,2})시', t).group(1))
+            if not (0 < h <= 23):
+                continue
+        cleaned.append(t)
+    fields['TIME'] = _dedupe(cleaned)
